@@ -533,7 +533,7 @@ class MemoryInbox:
             if (
                 not force
                 and candidates
-                and len(candidates) < self.BACKGROUND_BATCH_MIN
+                and len(candidates) < min(self.BACKGROUND_BATCH_MIN, bounded_limit)
                 and self._age_seconds(str(candidates[0].get("created_at", ""))) < self.BACKGROUND_BATCH_MAX_WAIT_SECONDS
             ):
                 wait_seconds = max(

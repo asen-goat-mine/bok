@@ -13,6 +13,7 @@ from privacy_audit import scan_path
 UI_FILES = (
     "index.html",
     "app.js",
+    "atlas-physics.js",
     "styles.css",
     "quick-note.html",
     "quick-note-window.js",

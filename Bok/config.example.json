@@ -8,7 +8,7 @@
   "provider_model": "",
   "provider_base_url": "",
   "provider_api_key_ref": "",
-  "auto_start_local_model": true,
+  "auto_start_local_model": false,
   "embedding_provider": "none",
   "embedding_model": "",
   "semantic_full_scan_limit": 6000,

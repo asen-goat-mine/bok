@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -175,7 +176,10 @@ class DesktopContracts(unittest.TestCase):
         self.assertIn('blocking_pick_folder()', source)
         self.assertIn('app.request_restart()', source)
         self.assertIn('WebviewUrl::App("quick-note.html".into())', source)
-        self.assertIn('generate_handler![quick_note_status, quick_note_save]', source)
+        handler = re.search(r"generate_handler!\s*\[([^\]]+)\]", source)
+        self.assertIsNotNone(handler)
+        registered = set(re.findall(r"\b[a-z_]\w*\b", handler.group(1)))
+        self.assertTrue({"quick_note_status", "quick_note_save", "retry_startup", "startup_status"}.issubset(registered))
         self.assertIn('require_quick_note_window(&window)?', source)
         self.assertIn('POST /api/bok/v1/quick-notes HTTP/1.1', source)
         self.assertIn('if !default_vault.exists()', source)

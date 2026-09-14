@@ -17,6 +17,7 @@
     .bar { height: 5px; margin-top: 30px; overflow: hidden; background: #212936; }
     .bar::after { content: ""; display: block; width: 38%; height: 100%; background: #39e5dd; animation: loading .56s ease-in-out infinite alternate; }
     .error { color: #ff859d; }
+    #retry { margin-top: 20px; padding: 9px 22px; border: 1px solid #39e5dd; background: transparent; color: #f5f1df; font: inherit; cursor: pointer; }
     @keyframes arrive { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
     @keyframes loading { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
   </style>
@@ -25,13 +26,42 @@
   <main>
     <div class="brand"><img class="mark" src="bok-k-icon.png" alt="Bok K"><div><h1>Bok 正在连接本地知识库</h1><p id="status">第一次启动会准备一份干净的 Starter Vault，之后不会覆盖你的内容。</p></div></div>
     <div class="bar" id="bar"></div>
+    <button id="retry" hidden>重新连接</button>
   </main>
   <script>
     window.showStartupError = (message) => {
       document.querySelector("#status").textContent = message;
       document.querySelector("#status").classList.add("error");
       document.querySelector("#bar").hidden = true;
+      document.querySelector("#retry").hidden = false;
+      document.querySelector("#retry").disabled = false;
     };
+    window.showStartupProgress = (message) => {
+      document.querySelector("#status").textContent = message;
+      document.querySelector("#status").classList.remove("error");
+      document.querySelector("#bar").hidden = false;
+      document.querySelector("#retry").hidden = true;
+    };
+    let startupRevision = 0;
+    window.showStartupStatus = (status) => {
+      if (!status || status.revision < startupRevision) return;
+      startupRevision = status.revision;
+      if (status.error) window.showStartupError(status.message);
+      else window.showStartupProgress(status.message);
+    };
+    // Native startup can fail before this script registers its callbacks.
+    // Recover the saved state; revisions keep a late snapshot from replacing
+    // a newer status delivered by the native worker.
+    window.__TAURI__.core.invoke("startup_status")
+      .then(window.showStartupStatus)
+      .catch(() => { if (startupRevision === 0) window.showStartupError("无法读取启动状态，请点击重新连接。"); });
+    document.querySelector("#retry").addEventListener("click", async () => {
+      const button = document.querySelector("#retry");
+      button.disabled = true;
+      window.showStartupProgress("正在重新启动本地服务…");
+      try { await window.__TAURI__.core.invoke("retry_startup"); }
+      catch (_) { window.showStartupError("重新连接未完成，请退出 Bok 后重新打开。"); button.disabled = false; }
+    });
   </script>
 </body>
 </html>

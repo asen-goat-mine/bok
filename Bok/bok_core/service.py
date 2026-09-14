@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .auth import AgentCredentialStore
+from .background import BackgroundProcessing
 from .config import BokConfig
 from .conversation import ConversationLedger
 from .errors import BokError, NotFoundError
@@ -30,6 +31,7 @@ class BokService:
     def __init__(self, config: BokConfig):
         self.config = config
         self.storage = VaultStorage(config)
+        self.background = BackgroundProcessing(self.storage)
         self.search_engine = VaultSearch(config, self.storage)
         self.memory = MemoryInbox(config, self.storage, self.search_engine)
         self.conversations = ConversationLedger(config, self.memory)
@@ -93,6 +95,7 @@ class BokService:
             "api_version": self.API_VERSION,
             "vault": self.config.vault_root.name,
             "local_only": self.config.local_only,
+            "background": self.background.status(),
             "provider": self.provider.info(),
             "index": index,
             "memory_inbox": self.memory.counts(),
@@ -341,6 +344,17 @@ class BokService:
 
     def process_captures(self, *, limit: int = 3, force: bool = True) -> dict:
         return self.memory.process_captures(limit=limit, force=force)
+
+    def process_background(self) -> dict:
+        settings = self.background.status()
+        if settings["paused"]:
+            return settings
+        self.process_captures(limit=settings["batch_limit"], force=False)
+        # Pause may arrive while a model request is in flight. Let that request
+        # finish, then stop before scheduling work for the other queue.
+        if not self.background.status()["paused"]:
+            self.process_person_learning(limit=settings["batch_limit"])
+        return self.background.status()
 
     def capture_status(self, capture_id: str = "", *, limit: int = 100) -> dict:
         return self.memory.capture_status(capture_id, limit=limit)

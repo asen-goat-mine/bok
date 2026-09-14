@@ -16,6 +16,8 @@ from .config import BokConfig
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 PUBLIC_PREFIX = "/api/bok"
 BROWSER_ROUTE_ALLOWLIST = {
+    ("GET", "/v1/background"),
+    ("POST", "/v1/background"),
     ("GET", "/v1/health"),
     ("GET", "/v1/today"),
     ("GET", "/v1/memory/inbox"),

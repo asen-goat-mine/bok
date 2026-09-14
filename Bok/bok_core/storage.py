@@ -269,12 +269,14 @@ class VaultStorage:
 
     def write(self, relative: str, text: str, *, expected_hash: Optional[str] = None, operation: str = "write", metadata: Optional[dict] = None) -> WriteResult:
         normalized = self._normalize(relative)
-        path = self.resolve(normalized, write=True)
         new_bytes = text.encode("utf-8")
         with self.lock:
+            path = self.resolve(normalized, write=True)
             before = path.read_bytes() if path.is_file() else None
             actual_hash = sha256_bytes(before) if before is not None else None
-            if expected_hash is not None and expected_hash != actual_hash:
+            # None means the caller expects a new document. Check absence under
+            # the same lock as the write so concurrent creates cannot overwrite.
+            if expected_hash != actual_hash:
                 raise ConflictError(
                     "The document changed after it was read",
                     details={"path": normalized, "expected_hash": expected_hash, "actual_hash": actual_hash},
@@ -314,11 +316,11 @@ class VaultStorage:
     def move(self, source: str, destination: str, *, expected_hash: str) -> dict:
         source_normalized = self._normalize(source)
         destination_normalized = self._normalize(destination)
-        source_path = self.resolve(source_normalized, write=True, must_exist=True)
-        destination_path = self.resolve(destination_normalized, write=True)
-        if destination_path.exists():
-            raise ConflictError("Move destination already exists", details={"path": destination_normalized})
         with self.lock:
+            source_path = self.resolve(source_normalized, write=True, must_exist=True)
+            destination_path = self.resolve(destination_normalized, write=True)
+            if destination_path.exists():
+                raise ConflictError("Move destination already exists", details={"path": destination_normalized})
             data = source_path.read_bytes()
             actual_hash = sha256_bytes(data)
             if not expected_hash or expected_hash != actual_hash:
@@ -363,8 +365,16 @@ class VaultStorage:
                 )
             before_path = self.versions / version_id / "before.md"
             if record.get("before_exists"):
-                before = before_path.read_bytes()
-                return self.write(relative, before.decode("utf-8"), expected_hash=current_hash, operation="rollback", metadata={"rolled_back_version": version_id})
+                try:
+                    if before_path.is_symlink():
+                        raise ValueError("Version snapshot cannot be a symbolic link")
+                    before = before_path.read_bytes()
+                    if sha256_bytes(before) != record.get("before_hash"):
+                        raise ValueError("Version snapshot hash mismatch")
+                    before_text = before.decode("utf-8")
+                except (OSError, UnicodeError, ValueError) as error:
+                    raise BokError("version_corrupt", "Version snapshot is missing or invalid", status=500, details={"version_id": version_id}) from error
+                return self.write(relative, before_text, expected_hash=current_hash, operation="rollback", metadata={"rolled_back_version": version_id})
             rollback_version = self._new_version(relative, current, None, "rollback", {"rolled_back_version": version_id})
             if path.exists():
                 trash_path = self.trash / rollback_version / relative

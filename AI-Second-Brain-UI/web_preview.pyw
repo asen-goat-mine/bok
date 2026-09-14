@@ -129,6 +129,8 @@ IGNORED_DIRS = {
     "__pycache__",
     "99-Logs",
     "_dist",
+    "target",
+    "build-resources",
 }
 
 
@@ -159,6 +161,9 @@ class VaultCache:
         self.source_fingerprint = ""
         self.etag = ""
         self.payload = b""
+        self.last_checked = 0.0
+        self.last_verified = 0.0
+        self.entries: dict[str, tuple[tuple[int, int, int, int], dict]] = {}
 
     @staticmethod
     def markdown_paths() -> tuple[list[Path], list[dict[str, str]]]:
@@ -184,7 +189,17 @@ class VaultCache:
                     paths.append(current_path / filename)
         return paths, skipped
 
-    def read(self) -> tuple[str, bytes]:
+    def read(self, *, max_age: float = 0.0) -> tuple[str, bytes]:
+        # Coalesce simultaneous refreshes; a change to one card must not hash
+        # and decode every other document again. Direct reads remain fresh.
+        with self.lock:
+            if self.payload and time.monotonic() - self.last_checked < max_age:
+                return self.etag, self.payload
+            result = self._read_locked()
+            self.last_checked = time.monotonic()
+            return result
+
+    def _read_locked(self) -> tuple[str, bytes]:
         paths, skipped = self.markdown_paths()
         snapshots: list[tuple[Path, os.stat_result]] = []
         parts: list[str] = []
@@ -197,22 +212,31 @@ class VaultCache:
                 skipped.append(diagnostic(path, error))
                 continue
             snapshots.append((path, stat))
-            parts.append(f"{relative}:{stat.st_mtime_ns}:{stat.st_size}")
+            parts.append(f"{relative}:{stat.st_mtime_ns}:{stat.st_ctime_ns}:{stat.st_size}:{stat.st_ino}")
 
         for item in skipped:
             parts.append(f"skipped:{item['path']}:{item['error']}")
         source_fingerprint = hashlib.sha256(
             "|".join(parts).encode("utf-8")
         ).hexdigest()
-        with self.lock:
-            if source_fingerprint == self.source_fingerprint and self.payload:
-                return self.etag, self.payload
+        # Windows ctime is creation time. Periodically verify bytes as well,
+        # so editors preserving size/mtime cannot keep stale content forever.
+        verify_content = time.monotonic() - self.last_verified >= 30
+        if not verify_content and source_fingerprint == self.source_fingerprint and self.payload:
+            return self.etag, self.payload
 
         files = []
+        entries = {}
         unreadable: list[dict[str, str]] = []
         for path, stat in snapshots:
             try:
                 relative = path.relative_to(VAULT_ROOT).as_posix()
+                signature = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+                cached = self.entries.get(relative)
+                if not verify_content and cached and cached[0] == signature:
+                    files.append(cached[1])
+                    entries[relative] = cached
+                    continue
                 digest = hashlib.sha256()
                 initial = bytearray()
                 with path.open("rb") as source:
@@ -238,6 +262,7 @@ class VaultCache:
                     "contentHash": digest.hexdigest(),
                 }
             )
+            entries[relative] = (signature, files[-1])
 
         payload = json.dumps(
             {
@@ -250,10 +275,15 @@ class VaultCache:
             separators=(",", ":"),
         ).encode("utf-8")
         etag = hashlib.sha256(payload).hexdigest()
-        with self.lock:
-            self.source_fingerprint = source_fingerprint
-            self.etag = etag
-            self.payload = payload
+        # A failed open is not a complete scan even if the file's stat stays
+        # unchanged. Retry missing entries next time; successful entries remain
+        # reusable so one temporarily locked file never forces a full reread.
+        self.source_fingerprint = "" if unreadable else source_fingerprint
+        self.etag = etag
+        self.payload = payload
+        self.entries = entries
+        if verify_content:
+            self.last_verified = time.monotonic()
         return etag, payload
 
 
@@ -697,7 +727,8 @@ class PreviewHandler(SimpleHTTPRequestHandler):
             {
                 "service": SERVICE_ID,
                 "version": SERVICE_VERSION,
-                "ready": bool(CACHE.payload),
+                "ready": True,
+                "indexReady": bool(CACHE.payload),
                 "vaultRoot": str(VAULT_ROOT),
                 "nativeShell": NATIVE_CONTROL_DIR is not None,
                 "nativeFolderPicker": native_folder_picker_available(),
@@ -716,7 +747,7 @@ class PreviewHandler(SimpleHTTPRequestHandler):
             )
             return
         try:
-            etag, payload = CACHE.read()
+            etag, payload = CACHE.read(max_age=0.5)
         except Exception as error:
             self.send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1360,15 +1391,8 @@ def run_preview() -> None:
     bound_host, bound_port = server.server_address
     url = f"http://{bound_host}:{bound_port}/"
     try:
-        etag, payload = CACHE.read()
-        scan = json.loads(payload.decode("utf-8"))
-        print(
-            "Initial Vault scan succeeded: "
-            f"{len(scan['files'])} files, "
-            f"{len(scan['skipped'])} skipped, "
-            f"{len(scan['unreadable'])} unreadable, etag={etag[:12]}",
-            flush=True,
-        )
+        # Publish the live local service before the first document scan. Large
+        # Vaults load through /api/vault while heartbeat and the UI stay usable.
         if not server_only and not open_app_window(url):
             raise RuntimeError("No supported browser could open the preview window.")
         print(f"Boujoy preview URL: {url}", flush=True)

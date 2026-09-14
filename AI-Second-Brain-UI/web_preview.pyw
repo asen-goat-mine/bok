@@ -16,6 +16,7 @@ import uuid
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -405,6 +406,12 @@ class PreviewServer(ThreadingHTTPServer):
         super().__init__(address, PreviewHandler)
         self.last_request = time.monotonic()
         self.started_at = time.time()
+
+    def server_bind(self) -> None:
+        # This service binds to a numeric loopback address. HTTPServer's reverse
+        # DNS lookup adds no useful identity and can stall offline startup.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def server_close(self) -> None:
         self.bok_bridge.close()

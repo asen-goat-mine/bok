@@ -200,12 +200,17 @@ try {
   console.log(JSON.stringify({ passed: true, fixtureFiles: files.length, cleanupNonblocking: true, cards, search, reader, graph, fileRequests }, null, 2));
 } finally {
   socket?.close();
-  if (browser && browser.exitCode === null) {
+  if (browser && browser.exitCode === null && browser.signalCode === null) {
     const stopped = new Promise((resolve) => browser.once("exit", resolve));
     browser.kill("SIGTERM");
     await Promise.race([stopped, delay(3000)]);
+    if (browser.exitCode === null && browser.signalCode === null) {
+      browser.kill("SIGKILL");
+      await Promise.race([stopped, delay(3000)]);
+    }
   }
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
-  rmSync(profile, { recursive: true, force: true });
+  // Chromium subprocesses may finish profile writes just after the parent exits.
+  rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }

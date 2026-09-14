@@ -183,6 +183,16 @@ class PreviewLifecycle(unittest.TestCase):
                 files, _ = self.preview.VaultCache.markdown_paths()
                 self.assertEqual(files, [root / "card.md"])
 
+    def test_loopback_bind_does_not_depend_on_reverse_dns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(self.preview, "VAULT_ROOT", Path(directory).resolve()), patch("socket.getfqdn", side_effect=AssertionError("Reverse DNS must not be used")):
+                server = self.preview.PreviewServer(("127.0.0.1", 0))
+                try:
+                    self.assertEqual(server.server_name, "127.0.0.1")
+                    self.assertEqual(server.server_port, server.server_address[1])
+                finally:
+                    server.server_close()
+
     def test_slow_vault_scan_does_not_block_handshake_or_heartbeat(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

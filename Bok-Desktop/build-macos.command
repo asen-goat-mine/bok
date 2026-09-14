@@ -13,6 +13,7 @@ VENV_DIR="${STAGE_DIR}/pyinstaller-venv"
 OUTPUT_DIR="${WORKSPACE_DIR}/_dist/Bok-Desktop-${VERSION}-macOS"
 CARGO_CACHE_DIR="${BOK_CARGO_HOME:-${STAGE_DIR}/cargo-home}"
 PYINSTALLER_BIN="${BOK_PYINSTALLER_BIN:-}"
+PRIVACY_DENY="${BOK_PRIVACY_DENY:-${USER:-local-user}}"
 
 cleanup() {
   local mounted_device
@@ -34,7 +35,7 @@ fi
 
 "${PYTHON_BIN}" "${PROJECT_DIR}/scripts/prepare_share.py" \
   --workspace "${WORKSPACE_DIR}" \
-  --deny "${USER:-local-user}"
+  --deny "${PRIVACY_DENY}"
 "${PYTHON_BIN}" "${PROJECT_DIR}/scripts/test_desktop_contracts.py"
 
 mkdir -p "${BUILD_PROJECT}"
@@ -114,7 +115,7 @@ codesign --verify --deep --strict --verbose=2 "${VERIFY_DIR}/Bok.app"
 "${PYTHON_BIN}" "${PROJECT_DIR}/scripts/privacy_audit.py" \
   "${APP_PATH}" \
   "${OUTPUT_DIR}/Bok-${VERSION}-macOS-${PACKAGE_ARCH}.zip" \
-  --deny "${USER:-local-user}"
+  --deny "${PRIVACY_DENY}"
 
 "${PYTHON_BIN}" "${PROJECT_DIR}/scripts/release_metadata.py" \
   --workspace "${WORKSPACE_DIR}" --checksums "${OUTPUT_DIR}"

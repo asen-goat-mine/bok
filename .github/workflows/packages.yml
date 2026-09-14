@@ -30,6 +30,9 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       PYTHONUTF8: '1'
+      # The generic hosted username "runner" also occurs in Tauri RunnerConfig
+      # symbols. Absolute user paths and secret patterns are still always scanned.
+      BOK_PRIVACY_DENY: 'ci-placeholder-user'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

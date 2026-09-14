@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   contracts:
     name: Contracts (${{ matrix.os }})
@@ -26,6 +30,15 @@ jobs:
         run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: UI product contracts
         run: python AI-Second-Brain-UI/tests/test_product_contracts.py
+      - name: Incremental cache and startup contracts
+        run: python AI-Second-Brain-UI/tests/test_preview_lifecycle.py
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Frontend and loading state regressions
+        run: |
+          node AI-Second-Brain-UI/tests/frontend-algorithms.mjs
+          node --test Bok-Desktop/tests/loading.test.mjs
       - name: Prepare desktop share resources
         run: python Bok-Desktop/scripts/prepare_share.py --workspace . --deny ci-placeholder-user
       - name: Desktop contracts
@@ -74,6 +87,8 @@ jobs:
         env:
           BOUJOY_PREVIEW_URL: http://127.0.0.1:8765/
         run: node AI-Second-Brain-UI/tests/browser-smoke.mjs
+      - name: Synthetic long-reader and graph performance
+        run: node AI-Second-Brain-UI/tests/browser-performance.mjs
       - name: Stop local preview
         if: always()
         shell: bash
@@ -82,3 +97,28 @@ jobs:
             kill "$(cat /tmp/bok-preview.pid)" 2>/dev/null || true
           fi
           cat /tmp/bok-preview.log || true
+
+  native-contracts:
+    name: Native startup and bridge (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Prepare synthetic test resources
+        run: |
+          python Bok-Desktop/scripts/prepare_share.py --workspace .
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          host = next(line.split(': ', 1)[1] for line in subprocess.check_output(['rustc', '-vV'], text=True).splitlines() if line.startswith('host:'))
+          sidecar = Path('Bok-Desktop/src-tauri/binaries') / ('bok-preview-' + host)
+          sidecar.parent.mkdir(exist_ok=True)
+          # Compile-only fixture: this job never builds or uploads installers.
+          sidecar.write_text('#!/bin/sh\nexit 1\n')
+          sidecar.chmod(0o755)
+          PY
+      - name: Native Rust contracts
+        run: cargo test --manifest-path Bok-Desktop/Cargo.toml --locked --lib

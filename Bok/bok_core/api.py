@@ -87,16 +87,16 @@ class BokAPIServer(ThreadingHTTPServer):
 
         def worker() -> None:
             while not self.capture_stop.is_set():
+                interval = 30
                 try:
-                    # Ordinary turns wait briefly so one Provider request can
-                    # analyze a 10-20 turn window. Exact per-turn receipts and
-                    # synchronous structured personal signals are unaffected.
-                    result = self.service.process_captures(limit=20, force=False)
-                    learning = self.service.process_person_learning(limit=20)
-                    waiting = int(result.get("remaining", 0)) + int(learning.get("remaining", 0))
+                    # Bound each queue and wait between rounds. Receipts and
+                    # explicitly requested operations remain available while
+                    # the automatic worker is paused.
+                    settings = self.service.process_background()
+                    interval = settings["interval_seconds"]
                 except Exception:
-                    waiting = 0
-                self.capture_stop.wait(15.0 if waiting else 2.0)
+                    pass
+                self.capture_stop.wait(interval)
 
         self.capture_thread = threading.Thread(target=worker, name="bok-memory-worker", daemon=True)
         self.capture_thread.start()
@@ -214,6 +214,8 @@ class BokAPIHandler(BaseHTTPRequestHandler):
                 self._require_admin()
             if route == "/v1/health":
                 payload = self.server.service.health()
+            elif route == "/v1/background":
+                payload = self.server.service.background.status()
             elif route == "/v1/today":
                 payload = self.server.service.today()
             elif route == "/v1/memory/inbox":
@@ -309,6 +311,9 @@ class BokAPIHandler(BaseHTTPRequestHandler):
 
             def invoke() -> dict:
                 service = self.server.service
+                if route == "/v1/background":
+                    self._require_admin()
+                    return service.background.update(body)
                 if route == "/v1/search":
                     self._require_scope("vault:read")
                     return service.search(

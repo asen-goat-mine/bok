@@ -11,6 +11,9 @@ use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_shell::ShellExt;
 
+mod startup;
+use startup::{Action as StartupAction, StartupWait};
+
 #[cfg(target_os = "macos")]
 type BackendChild = tauri_plugin_shell::process::CommandChild;
 #[cfg(target_os = "windows")]
@@ -20,6 +23,8 @@ struct RuntimeState {
     child: Mutex<Option<BackendChild>>,
     server_url: Mutex<Option<String>>,
     stop: Arc<AtomicBool>,
+    backend_exit: Arc<Mutex<Option<String>>>,
+    startup_feedback: Mutex<Option<serde_json::Value>>,
 }
 
 fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
@@ -191,13 +196,30 @@ fn start_backend(
     app: &tauri::App,
     arguments: &[String],
     _resource_root: &Path,
+    backend_exit: Arc<Mutex<Option<String>>>,
 ) -> Result<BackendChild, String> {
     let command = app
         .shell()
         .sidecar("bok-preview")
         .map_err(|error| error.to_string())?
         .args(arguments);
-    let (_events, child) = command.spawn().map_err(|error| error.to_string())?;
+    let (mut events, child) = command.spawn().map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn(async move {
+        use tauri_plugin_shell::process::CommandEvent;
+        while let Some(event) = events.recv().await {
+            let message = match event {
+                CommandEvent::Terminated(status) => Some(format!(
+                    "本地服务已退出（退出码：{:?}）。可以点击重试重新启动。", status.code
+                )),
+                // A pipe-read error is not proof that the process exited.
+                // Continue probing readiness until an actual termination.
+                _ => None, // Never persist stdout/stderr containing local paths or memory.
+            };
+            if let Some(message) = message {
+                if let Ok(mut exited) = backend_exit.lock() { *exited = Some(message); }
+            }
+        }
+    });
     Ok(child)
 }
 
@@ -206,6 +228,7 @@ fn start_backend(
     _app: &tauri::App,
     arguments: &[String],
     resource_root: &Path,
+    _backend_exit: Arc<Mutex<Option<String>>>,
 ) -> Result<BackendChild, String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -240,10 +263,49 @@ fn stop_child(mut child: BackendChild) {
 }
 
 fn show_startup_error(app: &tauri::AppHandle, message: &str) {
+    show_startup_feedback(app, message, true);
+}
+
+fn show_startup_progress(app: &tauri::AppHandle, message: &str) {
+    show_startup_feedback(app, message, false);
+}
+
+fn show_startup_feedback(app: &tauri::AppHandle, message: &str, error: bool) {
+    let Some(state) = app.try_state::<RuntimeState>() else { return; };
+    let Ok(mut feedback) = state.startup_feedback.lock() else { return; };
+    let revision = feedback.as_ref().and_then(|value| value["revision"].as_u64()).unwrap_or(0) + 1;
+    let value = serde_json::json!({"message": message, "error": error, "revision": revision});
+    *feedback = Some(value.clone());
+    drop(feedback);
     if let Some(window) = app.get_webview_window("main") {
-        let encoded = serde_json::to_string(message).unwrap_or_else(|_| "\"Unknown startup error\"".into());
-        let _ = window.eval(&format!("window.showStartupError?.({encoded});"));
+        let _ = window.eval(&format!("window.showStartupStatus?.({value});"));
     }
+}
+
+fn require_loading_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let url = window.url().map_err(|error| error.to_string())?;
+    if window.label() != "main" || url.port().is_some()
+        || !startup::loading_origin(url.scheme(), url.host_str(), url.path()) {
+        return Err("此操作只允许从 Bok 本地启动页面调用。".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn startup_status(window: tauri::WebviewWindow, state: State<'_, RuntimeState>) -> Result<Option<serde_json::Value>, String> {
+    require_loading_window(&window)?;
+    state.startup_feedback.lock().map(|value| value.clone()).map_err(|_| "启动状态暂不可用。".into())
+}
+
+#[tauri::command]
+fn retry_startup(window: tauri::WebviewWindow, app: tauri::AppHandle) -> Result<(), String> {
+    require_loading_window(&window)?;
+    if let Some(state) = app.try_state::<RuntimeState>() {
+        if state.stop.swap(true, Ordering::Relaxed) { return Ok(()); }
+    }
+    stop_runtime(&app);
+    app.request_restart();
+    Ok(())
 }
 
 fn open_quick_note(app: &tauri::AppHandle) {
@@ -308,16 +370,22 @@ fn probe_loopback(server_url: &str) -> Result<(), String> {
     stream
         .read_to_end(&mut response)
         .map_err(|_| "Bok 本地服务没有完成心跳响应。".to_string())?;
-    let status = String::from_utf8_lossy(&response)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    if status.contains(" 200 ") {
+    if heartbeat_ready(&response) {
         Ok(())
     } else {
         Err("Bok 本地服务尚未就绪。".to_string())
     }
+}
+
+fn heartbeat_ready(response: &[u8]) -> bool {
+    let response = String::from_utf8_lossy(response);
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else { return false; };
+    if headers.lines().next().unwrap_or_default().split_whitespace().nth(1) != Some("200") {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body).ok().map_or(false, |value| {
+        value["ready"] == true && value["service"] == "boujoy-knowledge-preview"
+    })
 }
 
 fn require_quick_note_window(window: &tauri::WebviewWindow) -> Result<(), String> {
@@ -378,7 +446,7 @@ fn post_quick_note(server_url: &str, text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{loopback_port, post_quick_note, probe_loopback};
+    use super::{heartbeat_ready, loopback_port, post_quick_note, probe_loopback};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -436,11 +504,9 @@ mod tests {
             let length = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..length]);
             assert!(request.starts_with("GET /api/heartbeat HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-                )
-                .unwrap();
+            let body = r#"{"service":"boujoy-knowledge-preview","ready":true}"#;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).unwrap();
         });
 
         probe_loopback(&format!("http://127.0.0.1:{port}/")).unwrap();
@@ -464,6 +530,19 @@ mod tests {
 
         assert!(probe_loopback(&format!("http://127.0.0.1:{port}/")).is_err());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn heartbeat_requires_the_expected_service_to_be_ready() {
+        for body in [
+            r#"{"service":"boujoy-knowledge-preview","ready":false}"#,
+            r#"{"service":"unrelated-service","ready":true}"#,
+            r#"{"ok":true}"#,
+            "not JSON",
+        ] {
+            assert!(!heartbeat_ready(format!("HTTP/1.1 200 OK\r\n\r\n{body}").as_bytes()));
+        }
+        assert!(heartbeat_ready(b"HTTP/1.1 200 OK\r\n\r\n{\"service\":\"boujoy-knowledge-preview\",\"ready\":true}"));
     }
 }
 
@@ -555,11 +634,27 @@ fn finish_startup(
     stop: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-            if let Ok(raw) = fs::read_to_string(&ready_file) {
-                let url = raw.trim().to_string();
-                if url.starts_with("http://127.0.0.1:") && url.ends_with('/') {
+        let started = Instant::now();
+        let mut waiting = StartupWait::default();
+        while !stop.load(Ordering::Relaxed) {
+            let mut exited = backend_exit_message(&app);
+            let ready_url = if exited.is_none() {
+                fs::read_to_string(&ready_file).ok().and_then(|raw| {
+                    let url = raw.trim().to_string();
+                    probe_loopback(&url).ok().map(|_| url)
+                })
+            } else { None };
+            // A heartbeat may block while the user retries or the child exits.
+            // Re-read both signals before allowing the old worker to navigate.
+            exited = backend_exit_message(&app).or(exited);
+            match waiting.next(started.elapsed(), stop.load(Ordering::Relaxed), exited.is_some(), ready_url.is_some()) {
+                StartupAction::Stop => return,
+                StartupAction::BackendExited => {
+                    show_startup_error(&app, exited.as_deref().unwrap_or("本地服务已退出，请点击重试。"));
+                    return;
+                }
+                StartupAction::Navigate => {
+                    let url = ready_url.expect("Ready action requires a URL");
                     if let (Some(window), Ok(parsed)) =
                         (app.get_webview_window("main"), url.parse())
                     {
@@ -579,14 +674,29 @@ fn finish_startup(
                         }
                     }
                 }
+                StartupAction::SlowNotice => show_startup_progress(&app, "本地服务启动比平时慢，正在继续等待。就绪后会自动打开知识库。"),
+                StartupAction::RetryNotice => show_startup_error(&app, "本地服务仍未就绪。可以继续等待或点击重试；知识库内容不会被覆盖。"),
+                StartupAction::Wait => {}
             }
             thread::sleep(Duration::from_millis(120));
         }
-        show_startup_error(
-            &app,
-            "本地服务没有在 15 秒内启动。请完全退出 Bok 后重新打开；你的知识库内容不会被覆盖。",
-        );
     });
+}
+
+fn backend_exit_message(app: &tauri::AppHandle) -> Option<String> {
+    let state = app.try_state::<RuntimeState>()?;
+    #[cfg(target_os = "windows")]
+    if let Ok(mut child) = state.child.lock() {
+        if let Some(child) = child.as_mut() {
+            if let Ok(Some(status)) = child.try_wait() {
+                if let Ok(mut exited) = state.backend_exit.lock() {
+                    *exited = Some(format!("本地服务已退出（{status}），请点击重试。"));
+                }
+            }
+        }
+    }
+    let message = state.backend_exit.lock().ok()?.clone();
+    message
 }
 
 fn stop_runtime(app: &tauri::AppHandle) {
@@ -608,7 +718,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![quick_note_status, quick_note_save])
+        .invoke_handler(tauri::generate_handler![quick_note_status, quick_note_save, retry_startup, startup_status])
         .on_window_event(|window, event| {
             if window.label() == "main" && matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 stop_runtime(window.app_handle());
@@ -639,12 +749,15 @@ pub fn run() {
                 &ready_file,
                 &control_dir,
             );
-            let child = start_backend(app, &arguments, &resource_root)?;
+            let backend_exit = Arc::new(Mutex::new(None));
+            let child = start_backend(app, &arguments, &resource_root, backend_exit.clone())?;
             let stop = Arc::new(AtomicBool::new(false));
             app.manage(RuntimeState {
                 child: Mutex::new(Some(child)),
                 server_url: Mutex::new(None),
                 stop: stop.clone(),
+                backend_exit,
+                startup_feedback: Mutex::new(None),
             });
             finish_startup(
                 app.handle().clone(),

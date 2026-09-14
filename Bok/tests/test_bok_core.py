@@ -5,6 +5,7 @@ import multiprocessing
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from pathlib import Path
 from urllib.error import HTTPError
@@ -126,6 +127,83 @@ class BokCoreContracts(unittest.TestCase):
         self.service.storage.write("03-Knowledge/conflict.md", "two", expected_hash=first.content_hash)
         with self.assertRaises(ConflictError):
             self.service.storage.write("03-Knowledge/conflict.md", "stale", expected_hash=first.content_hash)
+
+    def test_concurrent_document_creates_only_allow_one_writer(self) -> None:
+        path = "03-Knowledge/concurrent-create.md"
+        barrier = threading.Barrier(2)
+        real_content_hash = self.service.storage.content_hash
+
+        def read_before_either_writer_creates(relative):
+            value = real_content_hash(relative)
+            barrier.wait(timeout=5)
+            return value
+
+        def create(text):
+            try:
+                self.service.write_document(path, text, expected_hash=None)
+                return "ok", text
+            except BokError as error:
+                return error.code, text
+
+        with patch.object(self.service.storage, "content_hash", side_effect=read_before_either_writer_creates):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(create, ("writer-a", "writer-b")))
+        self.assertEqual(sorted(item[0] for item in outcomes), ["conflict", "ok"])
+        winner = next(text for status, text in outcomes if status == "ok")
+        self.assertEqual(self.service.storage.read_text(path), winner)
+        self.assertEqual(len(self.service.storage.list_versions(path)), 1)
+
+
+    def test_document_rollback_refuses_corrupt_or_missing_snapshot(self) -> None:
+        for condition in ("corrupt", "missing"):
+            with self.subTest(condition=condition):
+                path = f"03-Knowledge/rollback-{condition}.md"
+                original = self.service.write_document(path, "# Original\n", expected_hash=None)
+                changed = self.service.write_document(path, "# Newest\n", expected_hash=original["content_hash"])
+                snapshot = self.service.storage.versions / changed["version_id"] / "before.md"
+                if condition == "corrupt":
+                    snapshot.write_text("# Damaged snapshot\n", encoding="utf-8")
+                else:
+                    snapshot.unlink()
+                with self.assertRaises(BokError) as caught:
+                    self.service.rollback_document(changed["version_id"])
+                self.assertEqual(caught.exception.code, "version_corrupt")
+                self.assertEqual(self.service.storage.read_text(path), "# Newest\n")
+                self.assertEqual(len(self.service.storage.list_versions(path)), 2)
+
+
+    def test_concurrent_moves_do_not_overwrite_the_same_destination(self) -> None:
+        destination = "03-Knowledge/shared-destination.md"
+        sources = [f"03-Knowledge/move-{index}.md" for index in range(2)]
+        created = [self.service.storage.write(path, f"source-{index}") for index, path in enumerate(sources)]
+        barrier = threading.Barrier(2)
+        entered = threading.local()
+        real_acquire = self.service.storage.lock.acquire
+
+        def synchronize_first_lock():
+            if not getattr(entered, "seen", False):
+                entered.seen = True
+                barrier.wait(timeout=5)
+            return real_acquire()
+
+        def move(index):
+            try:
+                self.service.move_document(sources[index], destination, expected_hash=created[index].content_hash)
+                return "ok", index
+            except BokError as error:
+                return error.code, index
+
+        with patch.object(self.service.storage.lock, "acquire", side_effect=synchronize_first_lock):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(move, range(2)))
+        self.assertEqual(sorted(item[0] for item in outcomes), ["conflict", "ok"])
+        winner = next(index for status, index in outcomes if status == "ok")
+        loser = 1 - winner
+        self.assertEqual(self.service.storage.read_text(destination), f"source-{winner}")
+        self.assertFalse((self.vault / sources[winner]).exists())
+        self.assertEqual(self.service.storage.read_text(sources[loser]), f"source-{loser}")
+        self.assertEqual(len(self.service.storage.list_versions(destination)), 1)
+
 
     def test_cross_process_change_is_not_silently_overwritten(self) -> None:
         first = self.service.storage.write("03-Knowledge/process-conflict.md", "base")
@@ -1752,6 +1830,22 @@ class BokAPIContracts(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/health", token=False)
         self.assertEqual(caught.exception.code, 401)
+
+    def test_background_controls_require_admin_and_persist_valid_limits(self) -> None:
+        issued = self.service.issue_agent_credential("test-agent", scopes=["vault:read"])
+        for token, expected in ((False, 401), (issued["token"], 403)):
+            for body in (None, {"paused": True}):
+                with self.subTest(token=bool(token), body=body), self.assertRaises(HTTPError) as caught:
+                    self.request("/v1/background", body=body, token=token)
+                self.assertEqual(caught.exception.code, expected)
+        with self.request("/v1/background", body={"paused": True, "batch_limit": 2, "interval_seconds": 60}) as response:
+            saved = json.load(response)
+        with self.request("/v1/background") as response:
+            self.assertEqual(json.load(response), saved)
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/background", body={"paused": "false"})
+        self.assertEqual(caught.exception.code, 400)
+        self.assertTrue(self.service.background.status()["paused"])
 
     def test_health_is_authenticated_and_local(self) -> None:
         with self.request("/v1/health") as response:

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Protect concurrent document creation/moves and verify rollback snapshot integrity before restoring.
+- Keep startup responsive during slow indexing, avoid reverse DNS during loopback binding, expose recoverable retry states, and reject stale native startup events.
+- Reuse unchanged preview records, batch long-document rendering, preserve existing media cards while loading more, and reduce graph simulation work.
+- Respect path/tag filters in semantic search and route generic resume requests to the current focus project.
+- Add persistent background pause/resume and light/standard controls. Automatic processing defaults to four items per queue per round, with a 30-second interval. A pause takes effect after the active batch; queued content remains local.
+- New configurations no longer start Ollama automatically; existing explicit configuration values are preserved.
+- Add synthetic regression coverage for storage races, startup, retrieval, cache behavior, long readers and background settings, plus native Rust checks in CI.
+
+
 ## 0.6.0 — 2026-08-25
 
 First public release.

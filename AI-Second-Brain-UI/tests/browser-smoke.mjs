@@ -231,6 +231,22 @@ if (moreSelection.active !== "true" || !moreSelection.query.includes("内容")) 
 }
 await evaluate("document.querySelector('#filterRow [data-scope=library]')?.click(); true");
 
+// Calibrate the headless browser's frame clock: some hosts run it at 30 Hz.
+const baselineFrameMs = await evaluate(`(async () => {
+  const deltas = [];
+  let previous;
+  await new Promise(resolve => {
+    const sample = now => {
+      if (previous != null) deltas.push(now - previous);
+      previous = now;
+      if (deltas.length >= 30) resolve(); else requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  });
+  return deltas.sort((a, b) => a - b)[15];
+})()`);
+if (!(baselineFrameMs > 0 && baselineFrameMs <= 50)) throw new Error(`Unusable browser frame clock: ${baselineFrameMs} ms`);
+
 const frameAudit = await evaluate(`(async () => {
   const scroller = document.scrollingElement;
   const deltas = [];
@@ -259,7 +275,8 @@ const frameAudit = await evaluate(`(async () => {
     nativeScrollingObserved,
   };
 })()`);
-if (frameAudit.frames !== 90 || frameAudit.p95Ms > 25) {
+frameAudit.baselineMs = Number(baselineFrameMs.toFixed(2));
+if (frameAudit.frames !== 90 || frameAudit.p95Ms > Math.max(25, baselineFrameMs * 1.5)) {
   throw new Error(`Scroll frame pacing is unstable: ${JSON.stringify(frameAudit)}`);
 }
 if (nativeCompositor.native && !frameAudit.nativeScrollingObserved) throw new Error(`Native scroll compositor mode was never activated: ${JSON.stringify(frameAudit)}`);
@@ -510,6 +527,10 @@ await evaluate(`(() => {
     if (path.endsWith('/quick-notes') && method === 'GET') return json(fixture.notes);
     if (path.endsWith('/activity')) return json(fixture.activity);
     if (path.endsWith('/health')) return json(fixture.health);
+    if (path.endsWith('/background')) {
+      fixture.health.background = { paused: false, batch_limit: 4, interval_seconds: 30, ...fixture.health.background, ...JSON.parse(init.body || '{}') };
+      return json(fixture.health.background);
+    }
     if (path.endsWith('/versions')) return json(fixture.versions);
     if (path.endsWith('/person/backups') && method === 'GET') return json(fixture.personalBackups);
     if (path.endsWith('/search')) return json(fixture.search);
@@ -610,6 +631,29 @@ for (let attempt = 0; attempt < 80; attempt += 1) {
   await delay(25);
 }
 if (!(await evaluate("window.__memoryRequests.some((item) => item.path.endsWith('/person/backups/create'))"))) throw new Error("Personal Core backup action was not sent.");
+
+// Exercise actual settings controls and re-rendering against the contract fixture.
+for (const [action, expected] of [
+  ["pause", { paused: true, batch_limit: 4, interval_seconds: 30 }],
+  ["light", { paused: true, batch_limit: 2, interval_seconds: 60 }],
+  ["resume", { paused: false, batch_limit: 2, interval_seconds: 60 }],
+  ["standard", { paused: false, batch_limit: 4, interval_seconds: 30 }],
+]) {
+  const before = await evaluate("window.__memoryRequests.filter(item => item.path.endsWith('/background')).length");
+  await evaluate(`document.querySelector('[data-background-control="${action}"]').click(); true`);
+  let matched = false;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    matched = await evaluate(`(() => {
+      const card = document.querySelector('[data-background-control]')?.closest('article');
+      return window.__memoryRequests.filter(item => item.path.endsWith('/background')).length > ${before}
+        && card?.querySelector('[data-background-control="${expected.paused ? "resume" : "pause"}"]:not(:disabled)') != null
+        && card.innerText.includes('最多 ${expected.batch_limit} 条，间隔 ${expected.interval_seconds} 秒');
+    })()`);
+    if (matched) break;
+    await delay(25);
+  }
+  if (!matched) throw new Error(`Background settings failed after ${action}`);
+}
 
 await send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true }, sessionId);
 await delay(100);

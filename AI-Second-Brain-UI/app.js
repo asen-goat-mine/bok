@@ -4,7 +4,7 @@ const CONFIG = {
   pollInterval: 5000,
   cardPageSize: 24,
   ignoredDirectories: new Set([
-    ".cache", ".codebuddy", ".codex", ".git", ".agents", ".mypy_cache", ".nox",
+    ".bok", ".cache", ".codebuddy", ".codex", ".git", ".agents", ".mypy_cache", ".nox",
     ".openai", ".pytest_cache", ".ruff_cache", ".tox", ".venv", ".workbuddy",
     "__pypackages__", "node_modules", "site-packages", "venv", "__pycache__", "99-Logs", "_dist",
   ]),
@@ -42,6 +42,7 @@ const state = {
   visibleCardCount: CONFIG.cardPageSize,
   selectedPath: null,
   currentReaderPath: null,
+  readerRequest: 0,
   atlasFrame: null,
   atlasNodes: [],
   atlasEdges: [],
@@ -53,6 +54,9 @@ const state = {
   atlasSuppressClick: false,
   atlasSimulationAlpha: 1,
   atlasLastTime: 0,
+  atlasGraphKey: "",
+  atlasWidth: 0,
+  atlasHeight: 0,
   personData: null,
   personTab: "profile",
   personGraphNodes: [],
@@ -516,20 +520,29 @@ function recordsFromFallback(fileList) {
 }
 
 function makeFingerprint(records) {
-  return records.map((record) => `${record.path}:${record.lastModified}:${record.size}`).sort().join("|");
+  return records.map((record) => `${record.path}:${record.lastModified}:${record.size}:${record.contentHash || ""}`).sort().join("|");
 }
+
+let cleanupStatusRequest = null;
 
 async function readCleanupStatus() {
   if (!/^https?:$/u.test(window.location.protocol)) return null;
-  try {
-    const response = await fetch(`/api/cleanup?t=${Date.now()}`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`Cleanup status returned ${response.status}`);
-    const payload = await response.json();
-    state.cleanupStatus = payload;
-    return payload;
-  } catch {
-    return state.cleanupStatus;
-  }
+  if (cleanupStatusRequest) return cleanupStatusRequest;
+  cleanupStatusRequest = (async () => {
+    try {
+      const response = await fetch(`/api/cleanup?t=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Cleanup status returned ${response.status}`);
+      const payload = await response.json();
+      state.cleanupStatus = payload;
+      return payload;
+    } catch { return state.cleanupStatus; }
+  })();
+  try { return await cleanupStatusRequest; }
+  finally { cleanupStatusRequest = null; }
+}
+
+function refreshCleanupStatus() {
+  readCleanupStatus().then(() => { if (state.view === "health") renderHealth(); });
 }
 
 async function readNativeShellStatus() {
@@ -556,26 +569,28 @@ async function readServerVault({ force = false, announce = false } = {}) {
     });
     if (response.status === 304) {
       state.serverMode = true;
-      await readCleanupStatus();
+      refreshCleanupStatus();
       state.lastSync = new Date();
       elements.lastSync.textContent = formatTime(state.lastSync);
-      renderHealth();
+      if (state.view === "health") renderHealth();
       setSyncState("live", "本地同步中");
       return;
     }
     if (!response.ok) throw new Error(`Vault server returned ${response.status}`);
     const payload = await response.json();
-    await readCleanupStatus();
+    refreshCleanupStatus();
     state.serverEtag = response.headers.get("ETag") || "";
-    const records = payload.files.map((file) => createRecord(
-      file.path,
-      file.text,
-      { lastModified: file.lastModified, size: file.size },
-      { truncated: file.truncated, contentHash: file.contentHash },
-    ));
+    const previousRecords = new Map(state.files.map((record) => [record.path, record]));
+    const records = payload.files.map((file) => {
+      const previous = previousRecords.get(normalizePath(file.path));
+      if (previous && previous.lastModified === file.lastModified && previous.size === file.size
+        && previous.contentHash === String(file.contentHash || "")) return previous;
+      return createRecord(file.path, file.text, { lastModified: file.lastModified, size: file.size },
+        { truncated: file.truncated, contentHash: file.contentHash });
+    });
     const fingerprint = makeFingerprint(records);
     if (!force && fingerprint === state.fingerprint) {
-      renderHealth();
+      if (state.view === "health") renderHealth();
       return;
     }
     state.serverMode = true;
@@ -710,12 +725,20 @@ function scopeAllows(record, scope = state.scope) {
   return record.category.nav === scope && record.visibility === "library";
 }
 
+const searchFieldCache = new WeakMap();
+const filteredRecordCache = { files: null, query: "", scopes: new Map() };
+
 function searchMatch(record, tokens, fullQuery) {
   if (!tokens.length) return { score: 0, reason: "" };
-  const fields = [
-    ["标题", record.title, 100], ["别名", record.aliases.join(" "), 70], ["标签", record.tags.join(" "), 45],
-    ["路径", record.path, 25], ["摘要", record.excerpt, 15], ["正文", record.text, 5],
-  ].map(([label, value, weight]) => [label, String(value).toLocaleLowerCase("zh-CN"), weight]);
+  let cached = searchFieldCache.get(record);
+  if (!cached || cached.text !== record.text) {
+    cached = { text: record.text, fields: [
+      ["标题", record.title, 100], ["别名", record.aliases.join(" "), 70], ["标签", record.tags.join(" "), 45],
+      ["路径", record.path, 25], ["摘要", record.excerpt, 15], ["正文", record.text, 5],
+    ].map(([label, value, weight]) => [label, String(value).toLocaleLowerCase("zh-CN"), weight]) };
+    searchFieldCache.set(record, cached);
+  }
+  const fields = cached.fields;
   if (!tokens.every((token) => fields.some(([, value]) => value.includes(token)))) return null;
   let score = 0;
   let reason = "正文";
@@ -731,12 +754,20 @@ function searchMatch(record, tokens, fullQuery) {
 
 function filteredRecords(scope = state.scope) {
   const query = state.search.trim().toLocaleLowerCase("zh-CN");
+  if (filteredRecordCache.files !== state.files || filteredRecordCache.query !== query) {
+    filteredRecordCache.files = state.files;
+    filteredRecordCache.query = query;
+    filteredRecordCache.scopes.clear();
+  }
+  if (filteredRecordCache.scopes.has(scope)) return filteredRecordCache.scopes.get(scope);
   const tokens = query.replace(/[^\p{L}\p{N}_+.#-]+/gu, " ").split(/\s+/u).filter(Boolean);
-  return state.files.map((record) => {
+  const result = state.files.map((record) => {
     if (!scopeAllows(record, scope)) return null;
     const match = searchMatch(record, tokens, query);
     return match ? { record, ...match } : null;
   }).filter(Boolean).sort((a, b) => b.score - a.score || b.record.lastModified - a.record.lastModified);
+  filteredRecordCache.scopes.set(scope, result);
+  return result;
 }
 
 function updateScopeControls() {
@@ -762,6 +793,7 @@ function renderAll() {
   renderGlobalContext();
   renderHealth();
   renderView();
+  if (state.view === "atlas") renderAtlas();
 }
 
 function renderStatus() {
@@ -890,13 +922,41 @@ function cardMarkup(item, index = 0) {
   </article>`;
 }
 
+const boundCardContainers = new WeakSet();
+const cardGridCache = new WeakMap();
+
 function bindCards(container) {
-  container.querySelectorAll("[data-path]").forEach((card) => {
-    const open = () => selectRecord(card.dataset.path, true);
-    card.addEventListener("click", open);
-    card.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
-    });
+  if (boundCardContainers.has(container)) return;
+  boundCardContainers.add(container);
+  container.addEventListener("click", (event) => {
+    const card = event.target.closest("[data-path]");
+    if (card && container.contains(card)) selectRecord(card.dataset.path, true);
+  });
+  container.addEventListener("keydown", (event) => {
+    const card = event.target.closest("[data-path]");
+    if (card && container.contains(card) && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      selectRecord(card.dataset.path, true);
+    }
+  });
+}
+
+function renderCardGrid(container, items) {
+  const keys = items.map(({ record, reason }) => JSON.stringify([
+    record.path, record.title, record.updated, record.frontmatter.type, record.visibility, record.category.type, reason,
+  ]));
+  const previous = cardGridCache.get(container) || [];
+  const canAppend = previous.length <= keys.length && previous.every((key, index) => key === keys[index]);
+  if (canAppend) {
+    if (keys.length > previous.length) container.insertAdjacentHTML("beforeend", items.slice(previous.length).map((item, index) => cardMarkup(item, index + previous.length)).join(""));
+  } else container.innerHTML = items.map(cardMarkup).join("");
+  cardGridCache.set(container, keys);
+  bindCards(container);
+}
+
+function updateCardSelection() {
+  [elements.cardGrid, elements.overviewCardGrid].forEach((container) => {
+    container.querySelectorAll("[data-path]").forEach((card) => card.classList.toggle("is-selected", card.dataset.path === state.selectedPath));
   });
 }
 
@@ -908,17 +968,16 @@ function renderCards() {
   const scopeLabels = { library: "精选内容", projects: "项目", knowledge: "知识库", content: "内容", prompts: "提示词", business: "商业", skills: "Skills", all: "全部文件" };
   elements.cardsTitle.textContent = scopeLabels[state.scope] || "内容";
   elements.resultCount.textContent = `${all.length} 条结果 · 已展示 ${visible.length}`;
-  elements.cardGrid.innerHTML = visible.map(cardMarkup).join("");
+  renderCardGrid(elements.cardGrid, visible);
   elements.cardGrid.hidden = !all.length;
   elements.emptyState.hidden = Boolean(all.length);
   elements.loadMoreRow.hidden = remaining === 0;
   elements.loadMore.textContent = `再加载 ${Math.min(CONFIG.cardPageSize, remaining)} 条`;
-  bindCards(elements.cardGrid);
 
   const overviewItems = filteredRecords("library").slice(0, 4);
   elements.overviewResultCount.textContent = `${overviewItems.length} 条`;
-  elements.overviewCardGrid.innerHTML = overviewItems.map(cardMarkup).join("");
-  bindCards(elements.overviewCardGrid);
+  renderCardGrid(elements.overviewCardGrid, overviewItems);
+  updateCardSelection();
   renderVideoShowcase();
 }
 
@@ -948,8 +1007,13 @@ function indexedVideos() {
   return [...videos.values()].slice(0, 18);
 }
 
+let videoShowcaseKey = "";
+
 function renderVideoShowcase() {
   const videos = indexedVideos();
+  const key = JSON.stringify(videos);
+  if (key === videoShowcaseKey) return;
+  videoShowcaseKey = key;
   elements.videoResultCount.textContent = `${videos.length} 个视频`;
   elements.videoEmpty.hidden = videos.length > 0;
   elements.videoShowcase.innerHTML = videos.map((video, index) => `
@@ -978,6 +1042,7 @@ function setView(view, scope) {
   renderView();
   if (view === "library" || view === "overview") renderCards();
   if (view === "atlas") renderAtlas();
+  if (view === "health") renderHealth();
   if (view === "memory" && (viewChanged || !state.memoryData)) loadMemoryWorkspace();
   if (view === "person" && (viewChanged || !state.personData)) loadPersonDashboard();
   renderGlobalContext();
@@ -1208,7 +1273,9 @@ function renderMemorySettings() {
     { label: "Quiet Mode", value: "安静自动", detail: "普通内容自动保存可撤销，重要内容进入收件箱", good: true },
   ];
   const nativeAgentCard = state.nativeShell ? `<article class="memory-setting-card is-good"><span>Agent 衔接</span><strong>一键连接 Codex</strong><p>连接后请新建一个 Codex 任务；每个原生用户回合会静默进入 Bok 观察管线。</p><button class="person-action" type="button" data-connect-codex>连接 Codex</button></article>` : "";
-  elements.memorySettingsGrid.innerHTML = cards.map((item) => `<article class="memory-setting-card${item.good ? " is-good" : ""}"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong><p>${escapeHtml(item.detail)}</p></article>`).join("") + nativeAgentCard;
+  const background = health.background || {};
+  const backgroundCard = `<article class="memory-setting-card"><span>后台整理</span><strong>${background.paused ? "已暂停，内容继续安全排队" : "小批处理，降低后台占用"}</strong><p>暂停在当前批次完成后生效，内容继续安全排队。</p><div class="person-memory-actions"><button class="person-action" data-background-control="${background.paused ? "resume" : "pause"}">${background.paused ? "恢复后台整理" : "暂停后台整理"}</button><button class="person-action" data-background-control="light">轻量模式</button><button class="person-action" data-background-control="standard">标准模式</button></div><small>每个队列每轮最多 ${Number(background.batch_limit || 4)} 条，间隔 ${Number(background.interval_seconds || 30)} 秒</small></article>`;
+  elements.memorySettingsGrid.innerHTML = cards.map((item) => `<article class="memory-setting-card${item.good ? " is-good" : ""}"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong><p>${escapeHtml(item.detail)}</p></article>`).join("") + backgroundCard + nativeAgentCard;
   const backups = data.backups?.items || [];
   elements.memoryBackupList.innerHTML = backups.map((item) => `<article class="memory-backup-card"><div><strong>${escapeHtml(item.backup_id)}</strong><span>${escapeHtml(personDate(item.created_at))} · ${Number(item.file_count || 0)} 个 Markdown · ${item.valid ? "校验正常" : "需要检查"}</span></div><div><button class="person-action" data-memory-action="verify-backup" data-reference="${escapeHtml(item.backup_id)}">校验</button><button class="person-action danger" data-memory-action="restore-backup" data-reference="${escapeHtml(item.backup_id)}">恢复</button></div></article>`).join("") || `<p class="muted">还没有本地备份。</p>`;
   const personalBackups = data.personalBackups?.items || [];
@@ -2113,7 +2180,7 @@ function selectRecord(path, openReader = true) {
   state.selectedPath = record.path;
   renderSelectedContext(record);
   elements.contextPanel.classList.add("has-selection");
-  if (state.view === "library" || state.view === "overview") renderCards();
+  if (state.view === "library" || state.view === "overview") updateCardSelection();
   if (openReader) showReader(record);
 }
 
@@ -2217,10 +2284,9 @@ function renderMedia(alt, destination, recordPath) {
   return `<figure><img src="${src}" alt="${escapeHtml(alt)}" loading="lazy" /><figcaption>${escapeHtml(alt || resolved)}</figcaption></figure>`;
 }
 
-function markdownToHtml(markdown, recordPath) {
+function* markdownBlocks(markdown, recordPath) {
   const source = String(markdown).replace(/^---[\s\S]*?---\s*/u, "");
   const lines = source.split(/\r?\n/u);
-  const output = [];
   const isFence = (line) => /^\s*```/u.test(line);
   const isList = (line) => /^\s*(?:[-*+] |\d+[.)、]\s+)/u.test(line);
   const isSpecial = (line, next) => !line.trim() || isFence(line) || /^#{1,6}\s+/u.test(line) || /^\s*>/u.test(line) || /^\s*(?:---+|\*\*\*+)\s*$/u.test(line) || isList(line) || (line.includes("|") && /^\s*\|?\s*:?-{3,}/u.test(next || ""));
@@ -2233,7 +2299,7 @@ function markdownToHtml(markdown, recordPath) {
       index += 1;
       while (index < lines.length && !isFence(lines[index])) code.push(lines[index++]);
       if (index < lines.length) index += 1;
-      output.push(`<div class="code-block"><div class="code-toolbar"><span>${escapeHtml(fence[1] || "code")}</span><button type="button" data-copy-code>复制代码</button></div><pre><code>${escapeHtml(code.join("\n"))}</code></pre></div>`);
+      yield `<div class="code-block"><div class="code-toolbar"><span>${escapeHtml(fence[1] || "code")}</span><button type="button" data-copy-code>复制代码</button></div><pre><code>${escapeHtml(code.join("\n"))}</code></pre></div>`;
       continue;
     }
     if (line.includes("|") && /^\s*\|?\s*:?-{3,}/u.test(lines[index + 1] || "")) {
@@ -2242,7 +2308,7 @@ function markdownToHtml(markdown, recordPath) {
       const split = (value) => value.trim().replace(/^\||\|$/gu, "").split("|").map((cell) => cell.trim());
       const headers = split(tableLines[0]);
       const rows = tableLines.slice(2).map(split);
-      output.push(`<div class="table-wrap"><table><thead><tr>${headers.map((cell) => `<th>${renderInline(cell, recordPath)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${headers.map((_, cellIndex) => `<td>${renderInline(row[cellIndex] || "", recordPath)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`);
+      yield `<div class="table-wrap"><table><thead><tr>${headers.map((cell) => `<th>${renderInline(cell, recordPath)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${headers.map((_, cellIndex) => `<td>${renderInline(row[cellIndex] || "", recordPath)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
       continue;
     }
     const heading = line.match(/^(#{1,6})\s+(.+)$/u);
@@ -2250,14 +2316,14 @@ function markdownToHtml(markdown, recordPath) {
       const level = heading[1].length;
       const title = stripMarkdown(heading[2]);
       const id = `section-${index}-${title.replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-|-$/gu, "")}`;
-      output.push(`<h${level} id="${escapeHtml(id)}">${renderInline(heading[2], recordPath)}</h${level}>`);
+      yield `<h${level} id="${escapeHtml(id)}">${renderInline(heading[2], recordPath)}</h${level}>`;
       index += 1; continue;
     }
-    if (/^\s*(?:---+|\*\*\*+)\s*$/u.test(line)) { output.push("<hr>"); index += 1; continue; }
+    if (/^\s*(?:---+|\*\*\*+)\s*$/u.test(line)) { yield "<hr>"; index += 1; continue; }
     if (/^\s*>/u.test(line)) {
       const quote = [];
       while (index < lines.length && /^\s*>/u.test(lines[index])) quote.push(lines[index++].replace(/^\s*>\s?/u, ""));
-      output.push(`<blockquote>${quote.map((item) => renderInline(item, recordPath)).join("<br>")}</blockquote>`);
+      yield `<blockquote>${quote.map((item) => renderInline(item, recordPath)).join("<br>")}</blockquote>`;
       continue;
     }
     if (isList(line)) {
@@ -2266,60 +2332,110 @@ function markdownToHtml(markdown, recordPath) {
       const ordered = /^\s*\d+[.)、]\s+/u.test(listLines[0]);
       const hasTasks = listLines.some((item) => /^\s*[-*+]\s+\[[ xX]\]/u.test(item));
       const tag = ordered ? "ol" : "ul";
-      output.push(`<${tag}${hasTasks ? ' class="task-list"' : ""}>${listLines.map((item) => {
+      yield `<${tag}${hasTasks ? ' class="task-list"' : ""}>${listLines.map((item) => {
         const task = item.match(/^\s*[-*+]\s+\[([ xX])\]\s+(.+)$/u);
         const content = task ? task[2] : item.replace(/^\s*(?:[-*+] |\d+[.)、]\s+)/u, "");
         return `<li>${task ? `<span class="task-box ${/x/iu.test(task[1]) ? "is-done" : ""}">${/x/iu.test(task[1]) ? "✓" : ""}</span>` : ""}${renderInline(content, recordPath)}</li>`;
-      }).join("")}</${tag}>`);
+      }).join("")}</${tag}>`;
       continue;
     }
     const paragraph = [line];
     index += 1;
     while (index < lines.length && !isSpecial(lines[index], lines[index + 1])) paragraph.push(lines[index++]);
-    output.push(`<p>${paragraph.map((item) => renderInline(item, recordPath)).join("<br>")}</p>`);
+    yield `<p>${paragraph.map((item) => renderInline(item, recordPath)).join("<br>")}</p>`;
   }
-  return output.join("\n");
 }
+
+function markdownToHtml(markdown, recordPath) {
+  return [...markdownBlocks(markdown, recordPath)].join("\n");
+}
+
+const fullRecordLoads = new WeakMap();
 
 async function ensureFullRecord(record) {
   if (!record.truncated || !state.serverMode) return record;
-  const response = await fetch(`/api/file?path=${encodeURIComponent(record.path)}`, { cache: "no-store" });
-  if (!response.ok) throw new Error(`完整内容读取失败（${response.status}）`);
-  const text = await response.text();
-  const hydrated = createRecord(
-    record.path,
-    text,
-    { lastModified: record.lastModified, size: record.size },
-    { truncated: false, contentHash: record.contentHash },
-  );
-  Object.assign(record, hydrated);
-  return record;
+  if (fullRecordLoads.has(record)) return fullRecordLoads.get(record);
+  const loading = (async () => {
+    const response = await fetch(`/api/file?path=${encodeURIComponent(record.path)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`完整内容读取失败（${response.status}）`);
+    const text = await response.text();
+    Object.assign(record, createRecord(record.path, text,
+      { lastModified: record.lastModified, size: record.size },
+      { truncated: false, contentHash: record.contentHash }));
+    filteredRecordCache.files = null;
+    return record;
+  })();
+  fullRecordLoads.set(record, loading);
+  try { return await loading; }
+  finally { fullRecordLoads.delete(record); }
+}
+
+const readerContentCache = new Map();
+let readerCacheCharacters = 0;
+const readerTask = () => new Promise((resolve) => window.setTimeout(resolve, 0));
+
+function readerIsCurrent(record, request) {
+  return state.readerRequest === request && state.currentReaderPath === record.path && elements.readerDialog.open;
+}
+
+async function renderReaderRecord(record, request) {
+  const cached = readerContentCache.get(record.path);
+  const reusable = cached?.text === record.text;
+  const blocks = reusable ? cached.blocks : [];
+  const source = reusable ? blocks : markdownBlocks(record.text, record.path);
+  let batch = [];
+  let started = performance.now();
+  let firstBatch = true;
+  for (const block of source) {
+    if (!readerIsCurrent(record, request)) return;
+    if (!reusable) blocks.push(block);
+    batch.push(block);
+    if (batch.length < 60 && performance.now() - started < 8) continue;
+    if (firstBatch) { elements.markdownReader.innerHTML = ""; firstBatch = false; }
+    elements.markdownReader.insertAdjacentHTML("beforeend", batch.join("\n"));
+    batch = [];
+    await readerTask();
+    started = performance.now();
+  }
+  if (!readerIsCurrent(record, request)) return;
+  if (firstBatch) elements.markdownReader.innerHTML = "";
+  if (batch.length) elements.markdownReader.insertAdjacentHTML("beforeend", batch.join("\n"));
+  if (cached) { readerCacheCharacters -= cached.characters; readerContentCache.delete(record.path); }
+  const characters = record.text.length + blocks.reduce((total, block) => total + block.length, 0);
+  // Keep repeat reads fast without retaining an unbounded second copy of a Vault.
+  if (characters <= 4_000_000) {
+    readerContentCache.set(record.path, { text: record.text, blocks, characters });
+    readerCacheCharacters += characters;
+  }
+  while (readerContentCache.size > 8 || readerCacheCharacters > 4_000_000) {
+    const oldest = readerContentCache.keys().next().value;
+    readerCacheCharacters -= readerContentCache.get(oldest).characters;
+    readerContentCache.delete(oldest);
+  }
 }
 
 async function showReader(record) {
+  const request = ++state.readerRequest;
   state.currentReaderPath = record.path;
   elements.editCard.hidden = !canEditRecord(record);
   elements.deleteCard.hidden = !canDeleteRecord(record);
   elements.readerType.textContent = record.frontmatter.type || record.category.type;
   elements.readerTitle.textContent = record.title;
   elements.readerPath.textContent = record.path;
-  elements.markdownReader.innerHTML = record.truncated
-    ? '<div class="reader-loading" role="status">正在读取完整内容…</div>'
-    : markdownToHtml(record.text, record.path);
+  elements.markdownReader.innerHTML = '<div class="reader-loading" role="status">正在读取内容…</div>';
   if (!elements.readerDialog.open) elements.readerDialog.showModal();
   elements.markdownReader.scrollTop = 0;
-  if (record.truncated) {
-    try {
-      await ensureFullRecord(record);
-      if (state.currentReaderPath === record.path && elements.readerDialog.open) {
-        elements.readerType.textContent = record.frontmatter.type || record.category.type;
-        elements.readerTitle.textContent = record.title;
-        elements.markdownReader.innerHTML = markdownToHtml(record.text, record.path);
-      }
-    } catch (error) {
-      if (state.currentReaderPath === record.path && elements.readerDialog.open) {
-        elements.markdownReader.innerHTML = `<div class="person-empty"><strong>完整内容读取失败</strong><p>${escapeHtml(error.message)}</p></div>`;
-      }
+  try {
+    await readerTask();
+    if (!readerIsCurrent(record, request)) return;
+    await ensureFullRecord(record);
+    if (!readerIsCurrent(record, request)) return;
+    elements.readerType.textContent = record.frontmatter.type || record.category.type;
+    elements.readerTitle.textContent = record.title;
+    await renderReaderRecord(record, request);
+  } catch (error) {
+    if (readerIsCurrent(record, request)) {
+      elements.markdownReader.innerHTML = `<div class="person-empty"><strong>完整内容读取失败</strong><p>${escapeHtml(error.message)}</p></div>`;
     }
   }
 }
@@ -2487,12 +2603,29 @@ function renderAtlas() {
   if (state.atlasFrame) cancelAnimationFrame(state.atlasFrame);
   state.atlasFrame = null;
   const records = state.files.filter((record) => scopeAllows(record, "library"));
+  const width = elements.atlasStage.clientWidth;
+  const height = elements.atlasStage.clientHeight;
+  const key = makeFingerprint(records);
   elements.atlasEmpty.hidden = records.length > 0;
   elements.knowledgeGraph.hidden = records.length === 0;
+  if (key === state.atlasGraphKey && records.length && state.atlasNodes.length) {
+    if (width !== state.atlasWidth || height !== state.atlasHeight) {
+      const scaleX = width / Math.max(1, state.atlasWidth);
+      const scaleY = height / Math.max(1, state.atlasHeight);
+      [...state.atlasNodes, ...state.atlasGroups].forEach((node) => { node.x *= scaleX; node.y *= scaleY; });
+      state.atlasCamera.x *= scaleX;
+      state.atlasCamera.y *= scaleY;
+    }
+    state.atlasWidth = width; state.atlasHeight = height;
+    requestAtlasDraw();
+    return;
+  }
+  state.atlasGraphKey = key;
+  state.atlasWidth = width; state.atlasHeight = height;
   elements.atlasNodeList.innerHTML = records.slice().sort((a, b) => a.title.localeCompare(b.title, "zh-CN")).map((record) => `<li><button data-open="${escapeHtml(record.path)}"><span style="--node-color:${ATLAS_COLORS[record.category.nav] || "#168d7c"}"></span><strong>${escapeHtml(record.title)}</strong><small>${escapeHtml(record.category.type)}</small></button></li>`).join("");
   elements.atlasNodeList.querySelectorAll("[data-open]").forEach((button) => button.addEventListener("click", () => activateAtlasNode(button.dataset.open)));
-  if (!records.length) return;
-  const graph = buildAtlas(records, elements.atlasStage.clientWidth, elements.atlasStage.clientHeight);
+  if (!records.length) { state.atlasNodes = []; state.atlasEdges = []; state.atlasGroups = []; return; }
+  const graph = buildAtlas(records, width, height);
   state.atlasNodes = graph.nodes; state.atlasEdges = graph.edges; state.atlasGroups = graph.groups;
   state.atlasSimulationAlpha = state.reduceMotion ? 0 : 1;
   state.atlasLastTime = 0;
@@ -2502,7 +2635,13 @@ function renderAtlas() {
   const counts = new Map();
   records.forEach((record) => counts.set(record.category.nav, { label: record.category.type, count: (counts.get(record.category.nav)?.count || 0) + 1 }));
   elements.atlasLegend.innerHTML = [...counts.entries()].map(([key, item]) => `<span><i style="background:${ATLAS_COLORS[key] || "#168d7c"}"></i>${escapeHtml(item.label)} ${item.count}</span>`).join("");
-  drawAtlas(0);
+  requestAtlasDraw();
+}
+
+function requestAtlasDraw() {
+  if (!state.atlasFrame && state.view === "atlas" && document.visibilityState === "visible") {
+    state.atlasFrame = requestAnimationFrame(drawAtlas);
+  }
 }
 
 function activateAtlasNode(path) {
@@ -2512,24 +2651,16 @@ function activateAtlasNode(path) {
   elements.knowledgeGraph.dataset.selectedPath = path;
   if (state.atlasFrame) cancelAnimationFrame(state.atlasFrame);
   state.atlasFrame = null;
-  drawAtlas(0);
+  requestAtlasDraw();
   window.setTimeout(() => selectRecord(path, true), state.reduceMotion ? 0 : 140);
 }
 
 function atlasWorldToScreen(point, width, height) {
-  const camera = state.atlasCamera;
-  return {
-    x: width / 2 + camera.x + (point.x - width / 2) * camera.scale,
-    y: height / 2 + camera.y + (point.y - height / 2) * camera.scale,
-  };
+  return BokAtlasPhysics.worldToScreen(point, state.atlasCamera, width, height);
 }
 
 function atlasScreenToWorld(point, width, height) {
-  const camera = state.atlasCamera;
-  return {
-    x: width / 2 + (point.x - width / 2 - camera.x) / camera.scale,
-    y: height / 2 + (point.y - height / 2 - camera.y) / camera.scale,
-  };
+  return BokAtlasPhysics.screenToWorld(point, state.atlasCamera, width, height);
 }
 
 function atlasNodeAt(point, width, height) {
@@ -2540,56 +2671,11 @@ function atlasNodeAt(point, width, height) {
 }
 
 function stepAtlasPhysics(width, height) {
-  const alpha = state.atlasSimulationAlpha;
-  if (alpha <= 0) return 0;
-  const nodes = state.atlasNodes;
-  let movement = 0;
-  nodes.forEach((node) => {
-    const anchor = state.atlasGroups[node.group] || { x: width / 2, y: height / 2 };
-    node.vx += (anchor.x - node.x) * 0.0026 * alpha;
-    node.vy += (anchor.y - node.y) * 0.0026 * alpha;
-    node.vx += (width / 2 - node.x) * 0.00034 * alpha;
-    node.vy += (height / 2 - node.y) * 0.00034 * alpha;
-  });
-  for (let firstIndex = 0; firstIndex < nodes.length; firstIndex += 1) {
-    const first = nodes[firstIndex];
-    for (let secondIndex = firstIndex + 1; secondIndex < nodes.length; secondIndex += 1) {
-      const second = nodes[secondIndex];
-      const dx = second.x - first.x;
-      const dy = second.y - first.y;
-      const distanceSquared = Math.max(49, dx * dx + dy * dy);
-      if (distanceSquared > 15000) continue;
-      const distance = Math.sqrt(distanceSquared);
-      const force = 650 * alpha / distanceSquared;
-      const forceX = dx / distance * force;
-      const forceY = dy / distance * force;
-      first.vx -= forceX; first.vy -= forceY;
-      second.vx += forceX; second.vy += forceY;
-    }
-  }
-  state.atlasEdges.forEach((edge) => {
-    const first = nodes[edge.a];
-    const second = nodes[edge.b];
-    const dx = second.x - first.x;
-    const dy = second.y - first.y;
-    const distance = Math.max(1, Math.hypot(dx, dy));
-    const desired = edge.kind === "reference" ? 58 : 74;
-    const force = (distance - desired) * (edge.kind === "reference" ? 0.004 : 0.0025) * alpha;
-    const forceX = dx / distance * force;
-    const forceY = dy / distance * force;
-    first.vx += forceX; first.vy += forceY;
-    second.vx -= forceX; second.vy -= forceY;
-  });
-  nodes.forEach((node) => {
-    node.vx *= 0.84; node.vy *= 0.84;
-    const speed = Math.hypot(node.vx, node.vy);
-    if (speed > 3.4) { node.vx *= 3.4 / speed; node.vy *= 3.4 / speed; }
-    node.x = Math.max(22, Math.min(width - 22, node.x + node.vx));
-    node.y = Math.max(52, Math.min(height - 22, node.y + node.vy));
-    movement += Math.hypot(node.vx, node.vy);
-  });
-  state.atlasSimulationAlpha = Math.max(0.012, alpha * 0.982);
-  return nodes.length ? movement / nodes.length : 0;
+  const result = BokAtlasPhysics.step({
+    nodes: state.atlasNodes, edges: state.atlasEdges, groups: state.atlasGroups, alpha: state.atlasSimulationAlpha,
+  }, width, height);
+  state.atlasSimulationAlpha = result.alpha;
+  return result.movement;
 }
 
 function changeAtlasZoom(factor, point) {
@@ -2604,16 +2690,17 @@ function changeAtlasZoom(factor, point) {
   camera.scale = next;
   camera.x = focus.x - width / 2 - (world.x - width / 2) * next;
   camera.y = focus.y - height / 2 - (world.y - height / 2) * next;
-  if (!state.atlasFrame) drawAtlas(performance.now());
+  requestAtlasDraw();
 }
 
 function resetAtlasCamera() {
   state.atlasCamera = { x: 0, y: 0, scale: 1 };
-  if (!state.atlasFrame) drawAtlas(performance.now());
+  requestAtlasDraw();
 }
 
 function drawAtlas(time = 0) {
-  if (state.view !== "atlas") return;
+  state.atlasFrame = null;
+  if (state.view !== "atlas" || document.visibilityState !== "visible") return;
   const canvas = elements.knowledgeGraph;
   const context = canvas.getContext("2d");
   const width = canvas.clientWidth; const height = canvas.clientHeight;
@@ -2765,6 +2852,20 @@ elements.memorySearchScope.addEventListener("click", (event) => {
   elements.memorySearchMeta.textContent = state.memorySearchScope === "all" ? "将搜索完整知识库，包括系统说明和归档。" : "优先搜索日常知识；需要时再切换“搜索全部”。";
 });
 elements.memoryView.addEventListener("click", async (event) => {
+  const backgroundControl = event.target.closest("[data-background-control]");
+  if (backgroundControl) {
+    event.preventDefault();
+    const controls = elements.memorySettingsGrid.querySelectorAll("[data-background-control]");
+    controls.forEach((button) => { button.disabled = true; });
+    const choices = { pause: { paused: true }, resume: { paused: false }, light: { batch_limit: 2, interval_seconds: 60 }, standard: { batch_limit: 4, interval_seconds: 30 } };
+    try {
+      await bokRequest("background", { method: "POST", body: choices[backgroundControl.dataset.backgroundControl] });
+      await loadMemoryWorkspace();
+      showToast("后台整理设置已保存。");
+    } catch (error) { showToast(`设置未更新：${error.message}`); }
+    finally { controls.forEach((button) => { button.disabled = false; }); }
+    return;
+  }
   const connectCodex = event.target.closest("[data-connect-codex]");
   if (connectCodex) {
     event.preventDefault();
@@ -2910,12 +3011,13 @@ elements.searchInput.addEventListener("input", (event) => {
 elements.clearFilters.addEventListener("click", clearConditions);
 document.querySelectorAll("[data-clear-filters]").forEach((button) => button.addEventListener("click", clearConditions));
 document.querySelectorAll("[data-go-view]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.goView)));
-elements.closeSelection.addEventListener("click", () => { state.selectedPath = null; renderCards(); renderGlobalContext(); });
+elements.closeSelection.addEventListener("click", () => { state.selectedPath = null; updateCardSelection(); renderGlobalContext(); });
 elements.closeReader.addEventListener("click", () => elements.readerDialog.close());
 elements.readerDialog.addEventListener("close", () => {
+  state.readerRequest += 1;
+  elements.markdownReader.querySelectorAll("video, audio").forEach((media) => media.pause());
   if (state.view !== "atlas") return;
-  state.atlasSimulationAlpha = Math.max(state.atlasSimulationAlpha, state.reduceMotion ? 0 : 0.1);
-  if (!state.atlasFrame) drawAtlas(performance.now());
+  requestAtlasDraw();
 });
 elements.readerDialog.addEventListener("click", (event) => {
   if (event.target === elements.readerDialog) elements.readerDialog.close();
@@ -2956,7 +3058,7 @@ elements.knowledgeGraph.addEventListener("pointermove", (event) => {
     state.atlasCamera.y = state.atlasDrag.cameraY + deltaY;
     state.atlasPointer = { x: -9999, y: -9999 };
   } else state.atlasPointer = point;
-  if (!state.atlasFrame) drawAtlas(0);
+  requestAtlasDraw();
 });
 const finishAtlasDrag = (event) => {
   if (!state.atlasDrag) return;
@@ -2970,7 +3072,7 @@ elements.knowledgeGraph.addEventListener("pointercancel", (event) => { finishAtl
 elements.knowledgeGraph.addEventListener("pointerleave", () => {
   if (state.atlasDrag) return;
   state.atlasPointer = { x: -9999, y: -9999 };
-  if (!state.atlasFrame) drawAtlas(0);
+  requestAtlasDraw();
 });
 elements.knowledgeGraph.addEventListener("click", () => {
   if (state.atlasSuppressClick) { state.atlasSuppressClick = false; return; }
@@ -3035,8 +3137,7 @@ document.addEventListener("visibilitychange", () => {
   }
   if (state.view !== "atlas") return;
   if (document.visibilityState === "visible") {
-    state.atlasSimulationAlpha = Math.max(state.atlasSimulationAlpha, state.reduceMotion ? 0 : 0.08);
-    if (!state.atlasFrame) drawAtlas(performance.now());
+    requestAtlasDraw();
   }
   else if (state.atlasFrame) { cancelAnimationFrame(state.atlasFrame); state.atlasFrame = null; }
 });
@@ -3047,7 +3148,7 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase("en-US") === "k") { event.preventDefault(); elements.searchInput.focus(); }
-  if (event.key === "Escape" && state.selectedPath && !elements.readerDialog.open) { state.selectedPath = null; renderCards(); renderGlobalContext(); }
+  if (event.key === "Escape" && state.selectedPath && !elements.readerDialog.open) { state.selectedPath = null; updateCardSelection(); renderGlobalContext(); }
 });
 
 const platformName = navigator.userAgentData?.platform || navigator.platform || navigator.userAgent;

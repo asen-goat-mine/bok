@@ -105,6 +105,12 @@ PYTHONPATH=Bok python3 -m bok_core --vault . person backups
 PYTHONPATH=Bok python3 -m bok_core --vault . process
 ```
 
+## 后台整理设置
+
+在“Bok 工作台 → 设置 → 后台整理”中暂停或恢复自动整理，选择轻量模式（每个队列最多 2 条、间隔 60 秒）或标准模式（最多 4 条、间隔 30 秒）。暂停在当前批次完成后生效，新内容继续在本地排队；切换模式不会取消暂停。设置保存在当前 Vault 的本机运行状态中，重启后保留。手动 `process` 命令仍由用户主动执行，不受自动后台暂停控制。
+
+新配置默认 `auto_start_local_model: false`；用户可自行启动 Ollama 后使用本地模型，已有配置中的显式选项继续生效。模型不可用时内容留在本地队列。
+
 ## 接入 Codex 与其他 Agent
 
 Codex CLI/桌面端可注册本机 stdio MCP；在 Vault 根目录执行：
@@ -154,7 +160,7 @@ codex mcp add bok \
 ./Bok/run-tests.command
 ```
 
-当前 Bok Python 合同为 **116/116 通过**。测试覆盖逐轮收据、天然幂等、MCP 紧凑回执、10～20 条/空闲窗口批处理、缺项逐条回退、跨进程写锁、策略隔离、崩溃补投、保留期清理、分片队列、旧队列迁移、Personal Core 隔离、第三人称抽象信号与原句拒绝、低风险安静学习与旧卡升级迁移、Claim 全状态动作、内容确认与 Agent 授权分离、Observation/Outcome/影响学习、彻底忘记及中断恢复、垃圾清理保护、逐 Agent 凭证、知识库与 Personal Core 双备份、精确/合并恢复与事务回滚、损坏 ZIP 结构化失败、范围过滤、历史/拒绝守卫、损坏与符号链接失败关闭、替代链和版本 journal 中断恢复、真实问题检索回归、真实 HTTP API、MCP 与 UI bridge；模型判断与向量召回固定使用模拟 Provider，不启动或调用用户的本地模型。
+测试覆盖逐轮收据、天然幂等、MCP 紧凑回执、受控小批次/空闲窗口处理、缺项逐条回退、跨进程写锁、策略隔离、崩溃补投、保留期清理、分片队列、旧队列迁移、Personal Core 隔离、第三人称抽象信号与原句拒绝、低风险安静学习与旧卡升级迁移、Claim 全状态动作、内容确认与 Agent 授权分离、Observation/Outcome/影响学习、彻底忘记及中断恢复、垃圾清理保护、逐 Agent 凭证、知识库与 Personal Core 双备份、精确/合并恢复与事务回滚、损坏 ZIP 结构化失败、范围过滤、历史/拒绝守卫、损坏与符号链接失败关闭、替代链和版本 journal 中断恢复、真实问题检索回归、真实 HTTP API、MCP 与 UI bridge；模型判断与向量召回固定使用模拟 Provider，不启动或调用用户的本地模型。
 
 Windows：
 

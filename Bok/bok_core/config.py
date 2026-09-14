@@ -67,7 +67,7 @@ class BokConfig:
     provider_model: str = ""
     provider_base_url: str = ""
     provider_api_key_ref: str = ""
-    auto_start_local_model: bool = True
+    auto_start_local_model: bool = False
     embedding_provider: str = "none"
     embedding_model: str = ""
     deferred_search_prefixes: Tuple[str, ...] = field(default_factory=lambda: DEFAULT_DEFERRED_SEARCH_PREFIXES)

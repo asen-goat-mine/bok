@@ -166,6 +166,40 @@ class VaultSearch:
         return bool(re.search(r"(?:接着|继续|上次|当前项目|这个项目|做到哪|下一步|进度|收尾|续接)", query))
 
     @staticmethod
+    def _generic_resume_intent(query: str) -> bool:
+        """Route only subject-free continuation requests to the current project."""
+        normalized = re.sub(r"[\s，。！？、,.!?：:；;]+", "", query.casefold())
+        normalized = re.sub(r"^(?:(?:请问|请|帮我|麻烦|我们|咱们|现在|目前|先|再)+)", "", normalized)
+        normalized = re.sub(r"(?:一下|看看|看下|吧|呢|吗|了)+$", "", normalized)
+        return bool(re.fullmatch(
+            r"(?:接着|继续)(?:(?:上次|之前|当前|这个)(?:的)?(?:项目|工作|任务)?)?(?:做|进行|推进|开发|制作)?"
+            r"|(?:当前|这个)?(?:项目|工作|任务)?(?:做到哪|进度(?:如何|怎么样|到哪)?|下一步(?:行动|做什么|该做什么)?)"
+            r"|(?:收尾|续接)(?:当前|这个)?(?:项目|工作|任务)?",
+            normalized,
+        ))
+
+    @staticmethod
+    def _resume_section_key(item: IndexedChunk, query: str) -> tuple:
+        """Prefer actionable sections and dated updates over old project prose."""
+        heading = item.chunk.heading.casefold()
+        next_action = bool(re.search(r"下一步|后续行动|next(?:\s+steps?|\s+actions?)?$", heading))
+        current_status = bool(re.search(r"当前状态|当前进度|最新进展|current\s+status", heading))
+        dates = re.findall(r"(?<!\d)(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?!\d)", heading)
+        latest_date = max((tuple(map(int, date)) for date in dates), default=(0, 0, 0))
+        action_query = bool(re.search(r"接着|继续|下一步|收尾|续接", query))
+        if next_action:
+            priority = 0 if action_query else 2
+        elif dates:
+            priority = 1 if action_query else 0
+        elif current_status:
+            priority = 2 if action_query else 1
+        elif re.search(r"一句话结论|summary", heading):
+            priority = 3
+        else:
+            priority = 4
+        return priority, tuple(-part for part in latest_date), item.chunk.ordinal
+
+    @staticmethod
     def _locator_intent(query: str) -> bool:
         return bool(re.search(r"(?:哪里|在哪|位置|路径|文件|成片|终版|预览|打开|找到)", query))
 
@@ -274,7 +308,7 @@ class VaultSearch:
         score += adjustment
         reasons.extend(authority_reasons)
         if focus and chunk.path == focus:
-            if self._resume_intent(normalized):
+            if self._resume_intent(normalized) and (self._generic_resume_intent(normalized) or (matched and coverage >= 0.35)):
                 score += 30.0
                 reasons.append("current_project_resume")
             elif matched and coverage >= 0.35:
@@ -309,13 +343,13 @@ class VaultSearch:
             return 0.0
         return max(-1.0, min(1.0, numerator / (left_norm * right_norm)))
 
-    def _semantic_rerank(self, query: str, scored, state: SearchIndexState, *, explicit_cloud_consent: bool) -> Tuple[list, dict]:
+    def _semantic_rerank(self, query: str, scored, eligible_chunks: Sequence[IndexedChunk], *, explicit_cloud_consent: bool) -> Tuple[list, dict]:
         if self.config.embedding_provider in ("", "none") or not self.config.embedding_model:
             return scored, {"status": "disabled"}
-        full_semantic = self.provider.embedding_is_local() and len(state.chunks) <= self.config.semantic_full_scan_limit
+        full_semantic = self.provider.embedding_is_local() and len(eligible_chunks) <= self.config.semantic_full_scan_limit
         lexical = {item.chunk.chunk_id: (score, reasons) for score, item, reasons in scored}
         candidates = (
-            [(lexical.get(item.chunk.chunk_id, (0.0, []))[0], item, lexical.get(item.chunk.chunk_id, (0.0, []))[1]) for item in state.chunks]
+            [(lexical.get(item.chunk.chunk_id, (0.0, []))[0], item, lexical.get(item.chunk.chunk_id, (0.0, []))[1]) for item in eligible_chunks]
             if full_semantic
             else scored[:24]
         )
@@ -380,18 +414,29 @@ class VaultSearch:
         requested_tags = {item.casefold() for item in (tags or []) if item}
         scored = []
         with self.lock:
+            eligible_chunks = []
             for item in state.chunks:
                 if path_prefix and not item.chunk.path.startswith(path_prefix.rstrip("/") + "/") and item.chunk.path != path_prefix.rstrip("/"):
                     continue
                 if requested_tags and not requested_tags.intersection(tag.casefold() for tag in item.chunk.tags):
                     continue
+                eligible_chunks.append(item)
+            resume_route = bool(focus and self._generic_resume_intent(query) and any(item.chunk.path == focus for item in eligible_chunks))
+            if resume_route:
+                eligible_chunks = [item for item in eligible_chunks if item.chunk.path == focus]
+            for item in eligible_chunks:
                 score, reasons = self._lexical_score(item, query, query_terms, focus, state)
+                if resume_route:
+                    score = max(1.0, score)
+                    reasons.append("current_project_route")
                 if score > 0:
                     scored.append((score, item, reasons))
         scored.sort(key=lambda value: (-value[0], value[1].chunk.path, value[1].chunk.ordinal))
         semantic_status = {"status": "not_requested"}
         if semantic:
-            scored, semantic_status = self._semantic_rerank(query, scored, state, explicit_cloud_consent=explicit_cloud_consent)
+            scored, semantic_status = self._semantic_rerank(query, scored, eligible_chunks, explicit_cloud_consent=explicit_cloud_consent)
+        if resume_route:
+            scored.sort(key=lambda value: self._resume_section_key(value[1], query))
         try:
             limit_value = int(limit) if limit is not None else self.config.max_search_results
         except (TypeError, ValueError):

@@ -61,10 +61,14 @@ let browser;
 let socket;
 let closeBrowser;
 try {
-  browser = spawn(chrome, ["--headless=new", ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage"] : []), "--disable-background-networking", "--disable-component-update", "--disable-extensions", "--disable-sync", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: "ignore" });
+  browser = spawn(chrome, ["--headless=new", ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage"] : []), "--disable-background-networking", "--disable-component-update", "--disable-extensions", "--disable-sync", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
   const devtools = join(profile, "DevToolsActivePort");
-  for (let attempt = 0; attempt < 200 && !existsSync(devtools); attempt += 1) await delay(50);
-  if (!existsSync(devtools)) throw new Error("Chrome DevTools did not start.");
+  let browserDiagnostics = "";
+  browser.stderr.on("data", (chunk) => { browserDiagnostics = (browserDiagnostics + chunk).slice(-8000); });
+  browser.on("error", (error) => { browserDiagnostics += error.message; });
+  const startupDeadline = Date.now() + 30_000;
+  while (!existsSync(devtools) && Date.now() < startupDeadline && browser.exitCode === null && browser.signalCode === null) await delay(50);
+  if (!existsSync(devtools)) throw new Error(`Chrome DevTools did not start (exit=${browser.exitCode}, signal=${browser.signalCode}): ${browserDiagnostics}`);
   const [port, path] = readFileSync(devtools, "utf8").trim().split(/\r?\n/u);
   socket = new WebSocket(`ws://127.0.0.1:${port}${path}`);
   await new Promise((resolve, reject) => { socket.addEventListener("open", resolve, { once: true }); socket.addEventListener("error", reject, { once: true }); });

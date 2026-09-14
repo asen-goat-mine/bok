@@ -1,6 +1,7 @@
 param(
     [string]$Python = "python",
-    [string]$Cargo = "cargo"
+    [string]$Cargo = "cargo",
+    [string]$Tauri = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,7 +28,11 @@ Push-Location $Project
 try {
     $PreviousRustFlags = $env:RUSTFLAGS
     $env:RUSTFLAGS = "--remap-path-prefix=$Project=Bok-Desktop --remap-path-prefix=$env:USERPROFILE=LOCAL_BUILD_HOME"
-    & $Cargo tauri build --bundles nsis
+    if ($Tauri) {
+        & $Tauri build --bundles nsis
+    } else {
+        & $Cargo tauri build --bundles nsis
+    }
     if ($LASTEXITCODE -ne 0) { throw "Bok Windows 构建失败。" }
 } finally {
     $env:RUSTFLAGS = $PreviousRustFlags

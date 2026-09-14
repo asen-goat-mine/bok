@@ -35,10 +35,22 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
       - name: Validate release metadata
         run: python Bok-Desktop/scripts/test_release_metadata.py
-      - name: Install pinned Tauri builder
-        run: cargo install tauri-cli --version 2.11.4 --locked
+      - name: Install pinned macOS Tauri builder
+        if: runner.os == 'macOS'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/bok-tauri" --no-audit --no-fund @tauri-apps/cli@2.11.4
+          echo "$RUNNER_TEMP/bok-tauri/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Install pinned Windows Tauri builder
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm install --prefix "$env:RUNNER_TEMP/bok-tauri" --no-audit --no-fund @tauri-apps/cli@2.11.4
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri installation failed' }
       - name: Build macOS packages
         if: runner.os == 'macOS'
         env:
@@ -47,7 +59,7 @@ jobs:
       - name: Build Windows installer
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./Bok-Desktop/build-windows.ps1
+        run: ./Bok-Desktop/build-windows.ps1 -Tauri "$env:RUNNER_TEMP/bok-tauri/node_modules/.bin/tauri.cmd"
       - name: Verify installed macOS application
         if: runner.os == 'macOS'
         run: python Bok-Desktop/scripts/test_installed_package.py _dist/Bok-Desktop-*-macOS/*.zip

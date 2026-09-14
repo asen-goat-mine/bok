@@ -94,7 +94,7 @@ On first launch, Bok creates:
 
 Upgrades replace the app only. They do not overwrite the user's vault, Personal Core, quick notes, backups, or settings.
 
-Windows source build support is included. The first public Windows installer still requires final build and signing validation on real Windows hardware.
+Windows x64 users can use the `Bok_*_x64-setup.exe` installer attached to a release. It includes the Python runtime. Automated Windows acceptance covers startup, background settings, reinstall data preservation, shutdown and uninstall. Manual Windows 10/11 interaction and code-signing validation remain separate checks.
 
 ### Python core
 
@@ -202,7 +202,7 @@ cd Bok-Desktop
 .\build-windows.ps1
 ```
 
-Public distribution still requires Developer ID signing and notarization on macOS, and a code-signing certificate on Windows. Unsigned builds retain local functionality but may trigger operating-system warnings.
+Current macOS packages are ad-hoc signed and not notarized; Windows packages are unsigned. They retain local functionality but may trigger operating-system warnings. Developer ID signing/notarization and a Windows code-signing certificate are needed to reduce those warnings.
 
 ## Tests
 
@@ -334,7 +334,7 @@ macOS 用户可以在 [Releases](https://github.com/asen-goat-mine/bok/releases)
 
 后续升级只替换程序，不覆盖用户的 Vault、Personal Core、随手记、备份和设置。
 
-Windows 的源码构建入口已经提供；第一版公开安装包仍需要在真实 Windows 环境完成最终构建与签名验收。
+Windows x64 用户可使用 Release 中的 `Bok_*_x64-setup.exe`，已包含 Python 运行时。自动验收覆盖启动、后台设置、重装后数据保留、退出与卸载；Windows 10/11 手动交互与代码签名仍需单独验证。
 
 ### 运行 Python 核心
 
@@ -442,7 +442,7 @@ cd Bok-Desktop
 .\build-windows.ps1
 ```
 
-公开分发前，macOS 仍需要 Developer ID 与公证，Windows 仍需要代码签名证书；未签名不影响本地功能，但操作系统可能显示来源警告。
+当前 macOS 包使用 ad-hoc 签名、未经公证；Windows 包未签名。它们保留本地功能，但系统可能显示来源提示。减少这类提示仍需 macOS Developer ID 与公证，以及 Windows 代码签名证书。
 
 ## 测试
 

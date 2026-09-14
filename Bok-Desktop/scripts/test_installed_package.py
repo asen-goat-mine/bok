@@ -130,7 +130,10 @@ def exercise(program: Path, bundle: Path, data_root: Path, version: str, *, pres
             assert updated["paused"] is True
         print("PASS: " + ("reinstall preserves Vault, Personal Core and settings" if preserved else "fresh native startup, bundled core and background controls"), flush=True)
     finally:
-        stop_app(process, bundle)
+        if process.poll() is None:
+            stop_app(process, bundle)
+        elif sys.exc_info()[0] is None:
+            raise RuntimeError(f"Installed app exited before the close check: {process.returncode}")
         if base:
             wait_until(lambda: service_stopped(base), "backend shutdown", 30)
     print("PASS: native close exits and loopback service stops", flush=True)
@@ -152,7 +155,9 @@ def main() -> None:
     assert hashlib.sha256(artifact.read_bytes()).hexdigest() == expected[artifact.name]
     version = release_version(Path(__file__).resolve().parents[2])
     with tempfile.TemporaryDirectory(prefix="bok-installed-") as temporary:
-        install = Path(temporary) / "application"
+        # macOS /var is a symlink to /private/var. Tauri intentionally refuses
+        # executable paths through symlinks; launch the canonical installed path.
+        install = Path(temporary).resolve() / "application"
         if sys.platform == "win32":
             if " " in str(install):
                 raise RuntimeError("Use a runner temp path without spaces for the NSIS /D argument")

@@ -1,0 +1,67 @@
+name: Desktop packages
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/packages.yml'
+      - 'Bok-Desktop/**'
+      - 'Bok/**'
+      - 'AI-Second-Brain-UI/**'
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build and install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Validate release metadata
+        run: python Bok-Desktop/scripts/test_release_metadata.py
+      - name: Install pinned Tauri builder
+        run: cargo install tauri-cli --version 2.11.4 --locked
+      - name: Build macOS packages
+        if: runner.os == 'macOS'
+        env:
+          BOK_CARGO_HOME: ${{ github.workspace }}/.cargo-package-cache
+        run: zsh Bok-Desktop/build-macos.command
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./Bok-Desktop/build-windows.ps1
+      - name: Verify installed macOS application
+        if: runner.os == 'macOS'
+        run: python Bok-Desktop/scripts/test_installed_package.py _dist/Bok-Desktop-*-macOS/*.zip
+      - name: Verify Windows installation, reinstall and uninstall
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = @(Get-ChildItem _dist/Bok-Desktop-*-Windows/*.exe)
+          if ($installer.Count -ne 1) { throw 'Expected one release installer' }
+          python Bok-Desktop/scripts/test_installed_package.py $installer[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Installed package acceptance failed' }
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Bok-${{ matrix.os }}-${{ github.sha }}
+          path: _dist/**
+          if-no-files-found: error
+          retention-days: 14

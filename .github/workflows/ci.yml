@@ -43,6 +43,8 @@ jobs:
         run: python Bok-Desktop/scripts/prepare_share.py --workspace . --deny ci-placeholder-user
       - name: Desktop contracts
         run: python Bok-Desktop/scripts/test_desktop_contracts.py
+      - name: Release version and checksum contracts
+        run: python Bok-Desktop/scripts/test_release_metadata.py
       - name: Privacy audit
         run: >-
           python Bok-Desktop/scripts/privacy_audit.py

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.6.1 — 2026-09-14
+
+- Align desktop and core versions, derive package names from validated metadata, and write SHA-256 checksums.
+- Build macOS and Windows packages in CI and verify their bundled runtime, reinstall persistence, and shutdown on fresh runners.
 - Protect concurrent document creation/moves and verify rollback snapshot integrity before restoring.
 - Keep startup responsive during slow indexing, avoid reverse DNS during loopback binding, expose recoverable retry states, and reject stale native startup events.
 - Reuse unchanged preview records, batch long-document rendering, preserve existing media cards while loading more, and reduce graph simulation work.

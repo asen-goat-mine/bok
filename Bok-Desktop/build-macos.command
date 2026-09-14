@@ -6,7 +6,7 @@ WORKSPACE_DIR="${PROJECT_DIR:h}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CARGO_BIN="${CARGO_BIN:-$(command -v cargo 2>/dev/null || true)}"
 RUSTC_BIN="${RUSTC_BIN:-$(command -v rustc 2>/dev/null || true)}"
-VERSION="0.6.0"
+VERSION="$("${PYTHON_BIN}" "${PROJECT_DIR}/scripts/release_metadata.py" --workspace "${WORKSPACE_DIR}")"
 STAGE_DIR="$(mktemp -d /private/tmp/bok-desktop-macos.XXXXXX)"
 BUILD_PROJECT="${STAGE_DIR}/Bok-Desktop"
 VENV_DIR="${STAGE_DIR}/pyinstaller-venv"
@@ -65,6 +65,11 @@ PYINSTALLER_CONFIG_DIR="${STAGE_DIR}/pyinstaller-cache" "${PYINSTALLER_BIN}" \
   "${SOURCE_ROOT}/web_preview.pyw"
 
 HOST_TRIPLE="$("${RUSTC_BIN}" -vV | awk '/^host:/ { print $2 }')"
+case "${HOST_TRIPLE}" in
+  aarch64-apple-darwin) PACKAGE_ARCH=arm64 ;;
+  x86_64-apple-darwin) PACKAGE_ARCH=x64 ;;
+  *) print -u2 "Unsupported macOS host: ${HOST_TRIPLE}"; exit 1 ;;
+esac
 cp "${STAGE_DIR}/sidecar/bok-preview" "${BUILD_PROJECT}/src-tauri/binaries/bok-preview-${HOST_TRIPLE}"
 chmod +x "${BUILD_PROJECT}/src-tauri/binaries/bok-preview-${HOST_TRIPLE}"
 
@@ -93,22 +98,25 @@ fi
 rm -rf "${OUTPUT_DIR}"
 mkdir -p "${OUTPUT_DIR}"
 ditto --norsrc --noextattr --noqtn --noacl \
-  "${DMG_PATH}" "${OUTPUT_DIR}/Bok-${VERSION}-macOS-arm64.dmg"
+  "${DMG_PATH}" "${OUTPUT_DIR}/Bok-${VERSION}-macOS-${PACKAGE_ARCH}.dmg"
 ditto --norsrc --noextattr --noqtn --noacl -c -k --keepParent \
-  "${APP_PATH}" "${OUTPUT_DIR}/Bok-${VERSION}-macOS-arm64.zip"
+  "${APP_PATH}" "${OUTPUT_DIR}/Bok-${VERSION}-macOS-${PACKAGE_ARCH}.zip"
 
-if unzip -Z1 "${OUTPUT_DIR}/Bok-${VERSION}-macOS-arm64.zip" | \
+if unzip -Z1 "${OUTPUT_DIR}/Bok-${VERSION}-macOS-${PACKAGE_ARCH}.zip" | \
   grep -Eq '(^|/)\._|^__MACOSX/'; then
   print -u2 "ZIP 中出现了 AppleDouble 冗余文件，已终止发布。"
   exit 1
 fi
 VERIFY_DIR="${STAGE_DIR}/verify-archive"
 mkdir -p "${VERIFY_DIR}"
-ditto -x -k "${OUTPUT_DIR}/Bok-${VERSION}-macOS-arm64.zip" "${VERIFY_DIR}"
+ditto -x -k "${OUTPUT_DIR}/Bok-${VERSION}-macOS-${PACKAGE_ARCH}.zip" "${VERIFY_DIR}"
 codesign --verify --deep --strict --verbose=2 "${VERIFY_DIR}/Bok.app"
 "${PYTHON_BIN}" "${PROJECT_DIR}/scripts/privacy_audit.py" \
   "${APP_PATH}" \
-  "${OUTPUT_DIR}/Bok-${VERSION}-macOS-arm64.zip" \
+  "${OUTPUT_DIR}/Bok-${VERSION}-macOS-${PACKAGE_ARCH}.zip" \
   --deny "${USER:-local-user}"
+
+"${PYTHON_BIN}" "${PROJECT_DIR}/scripts/release_metadata.py" \
+  --workspace "${WORKSPACE_DIR}" --checksums "${OUTPUT_DIR}"
 
 print "Bok macOS 分享版已生成：${OUTPUT_DIR}"

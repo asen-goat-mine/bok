@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -58,6 +59,7 @@ if (!chrome) { server.close(); throw new Error("Chrome is required; set BOUJOY_T
 const profile = mkdtempSync(join(tmpdir(), "bok-ui-performance-"));
 let browser;
 let socket;
+let closeBrowser;
 try {
   browser = spawn(chrome, ["--headless=new", ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage"] : []), "--disable-background-networking", "--disable-component-update", "--disable-extensions", "--disable-sync", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: "ignore" });
   const devtools = join(profile, "DevToolsActivePort");
@@ -83,6 +85,7 @@ try {
     pending.set(id, { resolve, reject, timer });
     socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
   });
+  closeBrowser = () => socket.send(JSON.stringify({ id: ++nextId, method: "Browser.close" }));
   const { targetId } = await send("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
   await send("Runtime.enable", {}, sessionId);
@@ -199,18 +202,25 @@ try {
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ passed: true, fixtureFiles: files.length, cleanupNonblocking: true, cards, search, reader, graph, fileRequests }, null, 2));
 } finally {
-  socket?.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) {
     const stopped = new Promise((resolve) => browser.once("exit", resolve));
-    browser.kill("SIGTERM");
-    await Promise.race([stopped, delay(3000)]);
+    if (closeBrowser) {
+      try { closeBrowser(); } catch { /* Fall back to terminating our child. */ }
+      await Promise.race([stopped, delay(3000)]);
+    }
+    if (browser.exitCode === null && browser.signalCode === null) {
+      browser.kill("SIGTERM");
+      await Promise.race([stopped, delay(3000)]);
+    }
     if (browser.exitCode === null && browser.signalCode === null) {
       browser.kill("SIGKILL");
       await Promise.race([stopped, delay(3000)]);
     }
   }
+  socket?.close();
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
-  // Chromium subprocesses may finish profile writes just after the parent exits.
-  rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  // Async retries walk the directory again if Chromium finishes a profile
+  // write during removal; retrying only rmdir can leave that new file behind.
+  await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }

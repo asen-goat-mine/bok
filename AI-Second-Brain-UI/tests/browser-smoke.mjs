@@ -61,11 +61,15 @@ browser = spawn(chromePath, [
   "--remote-debugging-port=0",
   `--user-data-dir=${profile}`,
   "about:blank",
-], { stdio: "ignore" });
+], { stdio: ["ignore", "ignore", "pipe"] });
 
 const devtoolsFile = join(profile, "DevToolsActivePort");
-for (let attempt = 0; attempt < 200 && !existsSync(devtoolsFile); attempt += 1) await delay(50);
-if (!existsSync(devtoolsFile)) throw new Error("Chrome DevTools did not start.");
+let browserDiagnostics = "";
+browser.stderr.on("data", (chunk) => { browserDiagnostics = (browserDiagnostics + chunk).slice(-8000); });
+browser.on("error", (error) => { browserDiagnostics += error.message; });
+const startupDeadline = Date.now() + 30_000;
+while (!existsSync(devtoolsFile) && Date.now() < startupDeadline && browser.exitCode === null && browser.signalCode === null) await delay(50);
+if (!existsSync(devtoolsFile)) throw new Error(`Chrome DevTools did not start (exit=${browser.exitCode}, signal=${browser.signalCode}): ${browserDiagnostics}`);
 const [port, websocketPath] = readFileSync(devtoolsFile, "utf8").trim().split(/\r?\n/u);
 socket = new WebSocket(`ws://127.0.0.1:${port}${websocketPath}`);
 await new Promise((resolve, reject) => {

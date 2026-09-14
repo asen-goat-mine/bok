@@ -52,4 +52,10 @@ Bok Desktop 把现有 Bok UI 和本地 Markdown 能力封装成原生桌面应�
 - Windows：在 Windows PowerShell 运行 `build-windows.ps1`。
 - 仅验证资源与本地服务：运行 `python3 scripts/prepare_share.py --workspace ..`，再运行 `python3 scripts/test_desktop_contracts.py`。
 
+发布版本以 `src-tauri/tauri.conf.json` 为入口，构建前核对 Python 内核、Cargo 清单和锁文件版本一致。输出目录同时包含 `SHA256SUMS.txt`；在该目录运行 `shasum -a 256 -c SHA256SUMS.txt` 可验证文件。
+
+本机构建默认额外阻断当前用户名，可用 `BOK_PRIVACY_DENY` 指定需检查的唯一标识。全新 CI 使用占位标识，避免通用用户名 `runner` 误匹配第三方 `RunnerConfig` 符号；绝对用户路径、私钥和 API Key 的通用扫描始终启用。
+
+GitHub 的 `Desktop packages` 工作流构建真实 macOS/Windows 安装包，并在全新运行器上验证首次启动、内核版本、后台设置、重装后数据保留和退出后服务关闭。Windows 还验证静默安装与卸载。只有这些检查成功才上传构建产物；不会自动创建公开 Release。安装测试拒绝已有 Bok 数据，只能在一次性的 GitHub 桌面运行器上执行。模型对话、原生文件选择器的交互和操作系统来源警告仍需人工验收。
+
 macOS 对外无警告分发仍需要 Apple Developer ID 与公证；Windows 对外减少 SmartScreen 警告仍需要代码签名证书。没有证书不影响本地功能，但操作系统可能显示来源警告。

@@ -108,6 +108,17 @@ const evaluate = async (expression) => {
   return result.result.value;
 };
 
+// Rendering follows animation frames, which CI can schedule later than a
+// fixed sleep. Require the observable result within a bounded deadline.
+const waitForPage = async (condition, label) => {
+  const deadline = Date.now() + 5000;
+  do {
+    if (await evaluate(condition)) return;
+    await delay(25);
+  } while (Date.now() < deadline);
+  throw new Error(`Timed out waiting for ${label}`);
+};
+
 for (let attempt = 0; attempt < 160; attempt += 1) {
   if (await evaluate("document.readyState === 'complete' && document.querySelector('#syncLabel')?.textContent === '本地同步中'")) break;
   await delay(50);
@@ -282,7 +293,7 @@ if (frameAudit.frames !== 90 || frameAudit.p95Ms > Math.max(25, baselineFrameMs 
 if (nativeCompositor.native && !frameAudit.nativeScrollingObserved) throw new Error(`Native scroll compositor mode was never activated: ${JSON.stringify(frameAudit)}`);
 
 await evaluate("document.querySelector('[data-view=atlas]').click() || true");
-await delay(220);
+await waitForPage("Number(document.querySelector('#knowledgeGraph')?.dataset.zoom) === 1", "initial atlas frame");
 const atlas = await evaluate(`({
   visible: !document.querySelector('#atlasView')?.hidden,
   canvasWidth: document.querySelector('#knowledgeGraph')?.width || 0,
@@ -293,10 +304,11 @@ const atlas = await evaluate(`({
 })`);
 if (!atlas.visible || atlas.canvasWidth < 100 || !atlas.stats.includes("节点") || atlas.controls !== 3 || atlas.zoom !== 1 || atlas.overflow) throw new Error(`Knowledge atlas did not render: ${JSON.stringify(atlas)}`);
 await evaluate("document.querySelector('#atlasZoomIn')?.click(); true");
-await delay(40);
+await waitForPage(`Number(document.querySelector('#knowledgeGraph')?.dataset.zoom) > ${atlas.zoom}`, "atlas zoom frame");
 const atlasZoomed = await evaluate("Number(document.querySelector('#knowledgeGraph')?.dataset.zoom || 0)");
 if (atlasZoomed <= atlas.zoom) throw new Error(`Knowledge atlas zoom control failed: ${atlasZoomed}`);
 await evaluate("document.querySelector('#atlasReset')?.click(); true");
+await waitForPage("Number(document.querySelector('#knowledgeGraph')?.dataset.zoom) === 1", "atlas reset frame");
 if (process.env.BOUJOY_ATLAS_SCREENSHOT_PATH) {
   await delay(350);
   const screenshot = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false }, sessionId);

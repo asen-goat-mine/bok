@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import posixpath
 import re
 import threading
 from collections import Counter
@@ -166,6 +167,41 @@ class VaultSearch:
         return bool(re.search(r"(?:接着|继续|上次|当前项目|这个项目|做到哪|下一步|进度|收尾|续接)", query))
 
     @staticmethod
+    def _recent_content_intent(query: str) -> bool:
+        # Every clause must concern recent/next content: a named topic or an
+        # action in another clause must not get hidden by this narrow route.
+        clauses = [re.sub(r"\s+", "", part) for part in
+                   re.split(r"[，。！？、,.!?：:；;]+", query.casefold()) if part.strip()]
+        future_action = (r"(?:我)?(?:还|又)?(?:准备|打算)?(?:能|可以|该)?"
+                         r"(?:做|拍|发)(?:点)?(?:什么|啥)?")
+        pattern = (
+            r"(?:请问|帮我看看|帮我看下)?(?:我|我们)?"
+            r"(?:(?:最近|近期)(?:都|在|又)?(?:做|制作|发|发布)(?:了|过|的)?"
+            r"(?:哪些|什么|了哪些|了什么)?(?:视频|内容)(?:有哪些)?"
+            r"|接下来" + future_action + r"(?:视频|内容)"
+            r"|(?:下一条|下一期)" + future_action + r"(?:视频|内容)?)"
+            r"(?:呢|吗|呀|啊)?"
+        )
+        return bool(clauses) and all(re.fullmatch(pattern, part) for part in clauses)
+
+    def _recent_content_chunks(self, query: str, eligible: List[IndexedChunk]) -> List[IndexedChunk]:
+        """Use the curated recent-work section; never infer publication from dates."""
+        if not self._recent_content_intent(query):
+            return []
+        recent = [item for item in eligible if item.chunk.path == "00-System/Active-Context.md"
+                  and item.chunk.heading in {"最近制作的内容", "近期内容"}]
+        if not recent:
+            return []
+        paths = set()
+        for item in recent:
+            for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", item.chunk.text):
+                relative = posixpath.normpath(posixpath.join("00-System", target.split("#", 1)[0]))
+                if relative.startswith("02-Projects/"):
+                    paths.add(relative)
+        return recent + [item for item in eligible if item.chunk.path in paths
+                         and item.chunk.heading in {"一句话结论", "当前状态", "下一步行动"}]
+
+    @staticmethod
     def _generic_resume_intent(query: str) -> bool:
         """Route only subject-free continuation requests to the current project."""
         normalized = re.sub(r"[\s，。！？、,.!?：:；;]+", "", query.casefold())
@@ -205,7 +241,7 @@ class VaultSearch:
 
     @staticmethod
     def _style_intent(query: str) -> bool:
-        return bool(re.search(r"(?:按我|我的|平时|一贯).{0,8}(?:风格|习惯|口吻|写法)|(?:风格|口吻).{0,5}(?:写|改|生成)", query))
+        return bool(re.search(r"(?:按我|我的|平时|一贯).{0,8}(?:风格|习惯|口吻|写法)|(?:风格|口吻).{0,5}(?:写|改|生成)", query)) and not bool(re.search(r"(?:不要|不用|别|不按|无需).{0,10}(?:风格|习惯|口吻|写法)", query))
 
     @staticmethod
     def _explicit_document_query(query: str, chunk: MarkdownChunk) -> bool:
@@ -223,7 +259,17 @@ class VaultSearch:
             )
         )
 
-    def _source_adjustment(self, item: IndexedChunk, query: str, *, matched: int, coverage: float) -> Tuple[float, List[str]]:
+    def _style_metadata_match(self, query_terms: Sequence[str], chunk: MarkdownChunk) -> bool:
+        if chunk.document_role != "style-guide":
+            return False
+        generic = {"风格", "习惯", "口吻", "写法", "我的", "按我", "平时", "一贯", "的风", "格写", "格讲"}
+        metadata = " ".join([chunk.title, *chunk.tags, *chunk.aliases]).casefold()
+        return any(
+            len(term) >= 2 and term not in generic and term in metadata
+            for term in query_terms
+        )
+
+    def _source_adjustment(self, item: IndexedChunk, query: str, query_terms: Sequence[str], *, matched: int, coverage: float) -> Tuple[float, List[str]]:
         chunk = item.chunk
         explicit = self._explicit_document_query(query, chunk)
         if chunk.status in {"deprecated", "archived"} and not explicit:
@@ -233,7 +279,7 @@ class VaultSearch:
         if chunk.document_role == "asset-index":
             if self._locator_intent(query) and matched > 0:
                 subject_terms = [
-                    term for term in self._expanded_terms(query)
+                    term for term in query_terms
                     if term not in {"哪里", "在哪", "位置", "路径", "文件", "成片", "终版", "预览", "打开", "找到"}
                 ]
                 heading_bonus = 12.0 if any(term in chunk.heading.casefold() for term in subject_terms) else 0.0
@@ -246,7 +292,7 @@ class VaultSearch:
             return 0.0, []
         if chunk.document_role == "knowledge-card":
             return 4.0, ["knowledge_card_authority"]
-        if chunk.document_role == "style-guide" and self._style_intent(query):
+        if self._style_intent(query) and self._style_metadata_match(query_terms, chunk):
             return 30.0, ["style_guide_authority"]
         if chunk.document_role == "project-brief" and coverage >= 0.25:
             return 1.5, ["project_card_authority"]
@@ -304,7 +350,7 @@ class VaultSearch:
             score *= 0.5 + coverage
             if coverage >= 0.999:
                 reasons.append("all_terms")
-        adjustment, authority_reasons = self._source_adjustment(item, normalized, matched=matched, coverage=coverage)
+        adjustment, authority_reasons = self._source_adjustment(item, normalized, query_terms, matched=matched, coverage=coverage)
         score += adjustment
         reasons.extend(authority_reasons)
         if focus and chunk.path == focus:
@@ -424,19 +470,53 @@ class VaultSearch:
             resume_route = bool(focus and self._generic_resume_intent(query) and any(item.chunk.path == focus for item in eligible_chunks))
             if resume_route:
                 eligible_chunks = [item for item in eligible_chunks if item.chunk.path == focus]
+            recent_chunks = self._recent_content_chunks(query, eligible_chunks)
+            if recent_chunks:
+                eligible_chunks = recent_chunks
             for item in eligible_chunks:
                 score, reasons = self._lexical_score(item, query, query_terms, focus, state)
                 if resume_route:
                     score = max(1.0, score)
                     reasons.append("current_project_route")
+                if recent_chunks:
+                    score = max(1.0, score)
+                    reasons.append("recent_content_route")
                 if score > 0:
                     scored.append((score, item, reasons))
         scored.sort(key=lambda value: (-value[0], value[1].chunk.path, value[1].chunk.ordinal))
         semantic_status = {"status": "not_requested"}
         if semantic:
             scored, semantic_status = self._semantic_rerank(query, scored, eligible_chunks, explicit_cloud_consent=explicit_cloud_consent)
-        if resume_route:
+        if recent_chunks:
+            order = {id(item): index for index, item in enumerate(recent_chunks)}
+            scored.sort(key=lambda value: (value[1].chunk.path != "00-System/Active-Context.md",
+                                           value[1].chunk.heading != "一句话结论", order[id(value[1])]))
+        elif resume_route:
             scored.sort(key=lambda value: self._resume_section_key(value[1], query))
+        elif self._style_intent(query):
+            # Role is a routing signal, not a fixed score competing with an
+            # arbitrarily long script/index. Require subject overlap in the
+            # card's own metadata so an unrelated style guide cannot win.
+            def style_key(value):
+                _score, item, reasons = value
+                chunk = item.chunk
+                relevant = self._style_metadata_match(query_terms, chunk)
+                if relevant and "style_guide_route" not in reasons:
+                    reasons.append("style_guide_route")
+                return not relevant
+            scored.sort(key=style_key)
+        elif not self._locator_intent(query) and re.search(r"什么|关系|原理|知识|项目|复现|从零|训练", query):
+            subjects = re.findall(r"[a-zA-Z][a-zA-Z0-9]*(?:-[a-zA-Z0-9]+)*", query.casefold())
+            subjects = [term for term in subjects if term not in {"ai", "the", "and", "or", "is", "a"}]
+            if subjects:
+                def subject_key(value):
+                    chunk = value[1].chunk
+                    metadata = " ".join([chunk.title, *chunk.aliases]).casefold()
+                    matched = all(re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", metadata) for term in subjects)
+                    authoritative = chunk.document_role in {"knowledge-card", "project-brief"}
+                    project = "项目" in query and chunk.document_role == "project-brief"
+                    return (not (matched and authoritative), not (matched and project))
+                scored.sort(key=subject_key)
         try:
             limit_value = int(limit) if limit is not None else self.config.max_search_results
         except (TypeError, ValueError):

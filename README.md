@@ -1,5 +1,10 @@
 # Bok
 
+桌面预览可以复用同一知识库的本机 Memory API。两个入口共用已有服务，关掉预览也能继续从 Agent 读取记忆。搜索近期作品时会从 Active Context 的作品记录追到原项目卡，构建产物和示例知识库会被过滤。
+
+The preview can share the local Memory API for the same vault. Closing the preview leaves that service running. Recent-work queries follow the curated Active Context back to its project cards, and generated directories are excluded from search.
+
+
 > A local memory system that helps different AI agents keep understanding you.
 
 <p align="center">

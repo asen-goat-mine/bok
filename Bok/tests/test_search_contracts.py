@@ -119,6 +119,32 @@ class SearchRoutingContracts(unittest.TestCase):
         self.assertEqual(result["results"][0]["heading"], "下一步行动")
         self.assertFalse(any("这是演示口播" in text for text in embedded))
 
+    def test_recent_content_routes_to_curated_projects_without_publication_assumptions(self) -> None:
+        self.write("00-System/Active-Context.md", f"---\nfocus_path: {self.focus}\n---\n# Active Context\n\n## 最近制作的内容\n\n[视频甲](../02-Projects/video-a.md)：已交付，未确认发布。\n\n## 最近维护\n我最近做了哪些视频？是旧的失败检索。\n")
+        self.write("02-Projects/video-a.md", "# 视频甲\n\n## 一句话结论\n已交付，未确认发布。\n\n## 下一步行动\n等待反馈。\n")
+        for query in ("我最近做了哪些视频？", "我最近在发什么内容", "我接下来还能做点啥内容呢",
+                      "我最近在做什么视频，下一条准备发什么？", "我最近在做什么视频？下一期打算拍什么内容？"):
+            with self.subTest(query=query):
+                result = self.search.search(query, semantic=False)
+                self.assertEqual(result["results"][0]["heading"], "最近制作的内容")
+                self.assertEqual({item["path"] for item in result["results"]}, {"00-System/Active-Context.md", "02-Projects/video-a.md"})
+                self.assertIn("未确认发布", result["results"][0]["snippet"])
+                self.assertIn("recent_content_route", result["results"][0]["why"])
+        embedded = self.fake_local_embeddings()
+        result = self.search.search("我最近做了哪些视频？", semantic=True)
+        self.assertEqual(result["results"][0]["heading"], "最近制作的内容")
+        self.assertFalse(any("旧的失败检索" in text for text in embedded))
+        result = self.search.search("我最近做了哪些视频？", semantic=False, path_prefix="03-Knowledge")
+        self.assertFalse(any("recent_content_route" in item["why"] for item in result["results"]))
+        result = self.search.search("最近 Transformer 视频的原理是什么", semantic=False)
+        self.assertEqual(result["results"][0]["path"], "03-Knowledge/transformer.md")
+
+    def test_recent_content_compound_query_keeps_named_topic_and_action_scope(self) -> None:
+        for query in ("我最近做了哪些视频，Transformer 的原理是什么？",
+                      "我最近做了哪些视频？删除旧的视频。", "接下来该做什么？"):
+            with self.subTest(query=query):
+                self.assertFalse(self.search._recent_content_intent(query))
+
 
 if __name__ == "__main__":
     unittest.main()

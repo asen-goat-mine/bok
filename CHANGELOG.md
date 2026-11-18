@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reuse a running local Memory API after checking a fresh challenge bound to the shared vault. A private preview still works without the service. Closing a preview leaves the shared service running.
+- Follow curated recent-work links when answering recent-content queries. Keep unrelated style guides and generated build directories out of the results.
+- Align the service's reported version with the 0.6.0 desktop shell.
+
 - Protect concurrent document creation/moves and verify rollback snapshot integrity before restoring.
 - Keep startup responsive during slow indexing, avoid reverse DNS during loopback binding, expose recoverable retry states, and reject stale native startup events.
 - Reuse unchanged preview records, batch long-document rendering, preserve existing media cards while loading more, and reduce graph simulation work.

@@ -20,6 +20,11 @@ from .util import InterProcessFileLock, atomic_write_json, canonical_json, read_
 MAX_REQUEST_BYTES = 1024 * 1024
 
 
+def discovery_proof(token: str, nonce: str, vault: str) -> str:
+    message = json.dumps(["bok-local-discovery-v1", nonce, vault], separators=(",", ":"))
+    return hmac.digest(token.encode(), message.encode(), "sha256").hex()
+
+
 class IdempotencyStore:
     def __init__(self, service: BokService):
         self.path = service.config.state_dir / "state" / "idempotency.json"
@@ -207,6 +212,13 @@ class BokAPIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
+            if urlparse(self.path).path == "/v1/discovery":
+                nonce = self._query().get("nonce", "")
+                if not ipaddress.ip_address(self.client_address[0]).is_loopback or len(nonce) != 64 or any(c not in "0123456789abcdef" for c in nonce):
+                    self._json(400, {"error": "invalid local challenge"})
+                    return
+                self._json(200, {"proof": discovery_proof(self.server.token, nonce, str(self.server.service.config.vault_root.resolve()))})
+                return
             self._require_auth()
             route = urlparse(self.path).path.rstrip("/")
             query = self._query()

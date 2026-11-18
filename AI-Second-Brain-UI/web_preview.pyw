@@ -402,7 +402,8 @@ class PreviewServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address: tuple[str, int]) -> None:
-        self.bok_bridge = BokUIBridge(VAULT_ROOT)
+        shared_port = os.environ.get("BOK_SHARED_API_PORT")
+        self.bok_bridge = BokUIBridge(VAULT_ROOT, shared_api_port=int(shared_port) if shared_port else None)
         super().__init__(address, PreviewHandler)
         self.last_request = time.monotonic()
         self.started_at = time.time()

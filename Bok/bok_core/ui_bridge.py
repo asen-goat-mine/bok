@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hmac
+import secrets
 import json
 import threading
 from dataclasses import dataclass
@@ -7,18 +9,22 @@ from pathlib import Path
 from typing import Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from .api import MAX_REQUEST_BYTES, BokAPIServer, create_server
+from .api import discovery_proof, MAX_REQUEST_BYTES, BokAPIServer, create_server
 from .config import BokConfig
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 PUBLIC_PREFIX = "/api/bok"
 BROWSER_ROUTE_ALLOWLIST = {
-    ("GET", "/v1/background"),
-    ("POST", "/v1/background"),
     ("GET", "/v1/health"),
+    ("GET", "/v1/background"),
     ("GET", "/v1/today"),
     ("GET", "/v1/memory/inbox"),
     ("GET", "/v1/quick-notes"),
@@ -30,6 +36,7 @@ BROWSER_ROUTE_ALLOWLIST = {
     ("GET", "/v1/person/claims/explain"),
     ("GET", "/v1/person/backups"),
     ("POST", "/v1/search"),
+    ("POST", "/v1/background"),
     ("POST", "/v1/quick-notes"),
     ("POST", "/v1/quick-notes/promote"),
     ("POST", "/v1/quick-notes/archive"),
@@ -75,6 +82,7 @@ class BokUIBridge:
         vault_root: Path,
         *,
         config_overrides: Optional[Mapping[str, object]] = None,
+        shared_api_port: Optional[int] = None,
     ) -> None:
         self.vault_root = Path(vault_root).resolve()
         self.config_overrides = dict(config_overrides or {})
@@ -82,7 +90,9 @@ class BokUIBridge:
         self._server: Optional[BokAPIServer] = None
         self._thread: Optional[threading.Thread] = None
         self._base_url = ""
-        self._opener = build_opener(ProxyHandler({}))
+        self._shared_api_port = shared_api_port
+        self._shared_token = ""
+        self._opener = build_opener(ProxyHandler({}), _NoRedirect())
 
     @staticmethod
     def _json_response(status: int, code: str, message: str) -> BokBridgeResponse:
@@ -95,8 +105,26 @@ class BokUIBridge:
 
     def _ensure_started(self) -> None:
         with self._lock:
-            if self._server is not None:
+            if self._server is not None or self._shared_token:
                 return
+            port = self._shared_api_port
+            if port is None:
+                port = BokConfig.load(self.vault_root, self.config_overrides).port
+            token_file = self.vault_root / ".bok" / "auth-token"
+            if port and token_file.is_file():
+                nonce = secrets.token_hex(32)
+                base = f"http://127.0.0.1:{int(port)}"
+                token = token_file.read_text(encoding="utf-8").strip()
+                try:
+                    with self._opener.open(base + "/v1/discovery?nonce=" + nonce, timeout=0.75) as response:
+                        proof = json.loads(response.read(512)).get("proof", "")
+                    if token and hmac.compare_digest(proof, discovery_proof(token, nonce, str(self.vault_root))):
+                        self._base_url, self._shared_token = base, token
+                        return
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+            if self._shared_api_port is not None:
+                raise OSError("Cannot verify this Vault's shared Bok API")
             overrides = dict(self.config_overrides)
             overrides.update({"host": "127.0.0.1", "port": 0})
             config = BokConfig.load(self.vault_root, overrides)
@@ -150,9 +178,9 @@ class BokUIBridge:
 
         try:
             self._ensure_started()
-            assert self._server is not None
+            token = self._server.token if self._server is not None else self._shared_token
             request_headers = {
-                "Authorization": f"Bearer {self._server.token}",
+                "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
             }
             incoming = headers or {}
@@ -177,6 +205,10 @@ class BokUIBridge:
                         content_type=response.headers.get("Content-Type", "application/json; charset=utf-8"),
                     )
             except HTTPError as error:
+                if error.code == 401:
+                    with self._lock:
+                        if self._shared_token == token:
+                            self._shared_token = ""
                 raw = error.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     return self._json_response(502, "response_too_large", "Bok error response exceeded 8 MiB")
@@ -197,6 +229,7 @@ class BokUIBridge:
             self._server = None
             self._thread = None
             self._base_url = ""
+            self._shared_token = ""
         if server is None:
             return
         server.shutdown()
